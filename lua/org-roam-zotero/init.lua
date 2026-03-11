@@ -186,7 +186,7 @@ function M.sync(opts)
                 }
 
                 -- Insert into org-roam database (overwrite if already present)
-                roam.database:insert(node, { overwrite = true })
+                roam.database:insert(node, { overwrite = true }):wait()
                 INSTANCE.__synced_ids[node.id] = true
                 count = count + 1
             end

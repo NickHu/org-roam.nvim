@@ -348,14 +348,19 @@ function M:__on_buf_write(buf, uri)
         return
     end
 
-    -- Bump version after successful write
-    local new_version = version + 1
+    -- Determine the new version: prefer the API response, fall back to increment
+    local new_version
+    if type(result) == "table" and result.version then
+        new_version = result.version
+    else
+        new_version = version + 1
+    end
     self.__note_cache[note_key] = { version = new_version }
 
     -- Update the version in the buffer properties
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     for i, line in ipairs(lines) do
-        if line:match("^:ZOTERO_VERSION:") then
+        if line:match("^:ZOTERO_VERSION:%s") then
             lines[i] = ":ZOTERO_VERSION: " .. tostring(new_version)
             vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { lines[i] })
             break
