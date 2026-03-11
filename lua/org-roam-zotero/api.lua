@@ -334,7 +334,10 @@ function M:create_note(parent_item_key)
         return false, result
     end
 
-    -- Parse the multi-object creation response
+    -- Parse the multi-object creation response.
+    -- Zotero API v3 returns string keys ("0", "1", ...) in the successful
+    -- object; vim.fn.json_decode preserves them as string keys, but we check
+    -- both representations for robustness.
     if type(result) == "table" and result.successful then
         local first = result.successful["0"] or result.successful[0]
         if first then

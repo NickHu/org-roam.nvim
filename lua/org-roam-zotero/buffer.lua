@@ -286,7 +286,11 @@ function M:__on_buf_read(buf, uri)
     end
 
     ---@cast note_resp org-roam-zotero.ZoteroItem
-    local data = note_resp.data or {}
+    local data = note_resp.data
+    if not data then
+        vim.notify("org-roam-zotero: unexpected API response for note " .. note_key, vim.log.levels.WARN)
+        data = {}
+    end
     local note_html = data.note or ""
     local version = note_resp.version or cached.version
 

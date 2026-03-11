@@ -171,7 +171,7 @@ end
 ---Relations are URIs like "http://zotero.org/users/123/items/ABCDEF".
 ---@param relations table<string, string|string[]>|nil
 ---@return string[] item_keys
-local function extract_related_keys(relations)
+local function extract_related_item_keys(relations)
     if not relations then
         return {}
     end
@@ -291,11 +291,9 @@ function M.sync(opts)
                 nodes_by_item_key[item.data.key] = node.id
 
                 -- Collect related item keys from both parent item and note
-                local related = extract_related_keys(item.data.relations)
-                local note_related = extract_related_keys(note.data.relations)
-                for _, key in ipairs(note_related) do
-                    table.insert(related, key)
-                end
+                local related = extract_related_item_keys(item.data.relations)
+                local note_related = extract_related_item_keys(note.data.relations)
+                vim.list_extend(related, note_related)
                 if #related > 0 then
                     item_relations[node.id] = related
                 end
@@ -351,6 +349,6 @@ function M.reset()
 end
 
 -- Expose internal helpers for testing
-M._extract_related_keys = extract_related_keys
+M._extract_related_keys = extract_related_item_keys
 
 return M
