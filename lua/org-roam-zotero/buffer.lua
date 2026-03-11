@@ -276,7 +276,7 @@ function M:__on_buf_read(buf, uri)
     end
 
     -- Fetch the note directly to get fresh content
-    local ok_get, items = self.__api:get(
+    local ok_get, items = self.__api:read(
         string.format("/items/%s", note_key),
         { format = "json" }
     )
@@ -292,7 +292,7 @@ function M:__on_buf_read(buf, uri)
     -- Try to get the parent item's title
     local title = note_key
     if items.parentItem then
-        local ok_parent, parent = self.__api:get(
+        local ok_parent, parent = self.__api:read(
             string.format("/items/%s", items.parentItem),
             { format = "json" }
         )

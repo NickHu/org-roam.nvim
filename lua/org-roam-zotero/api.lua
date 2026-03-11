@@ -1,12 +1,14 @@
 -------------------------------------------------------------------------------
 -- API.LUA
 --
--- Zotero Web API v3 client.
+-- Zotero Web API v3 and local API client.
 -- See https://www.zotero.org/support/dev/web_api/v3/basics
+-- Local API: https://github.com/zotero/zotero/blob/8.0/chrome/content/zotero/xpcom/server/server_localAPI.js
 -------------------------------------------------------------------------------
 
 ---@class org-roam-zotero.Api
 ---@field private __config org-roam-zotero.Config
+---@field private __local_api_available boolean|nil #cached availability of local API
 local M = {}
 M.__index = M
 
@@ -32,10 +34,11 @@ function M:new(config)
     local instance = {}
     setmetatable(instance, M)
     instance.__config = config
+    instance.__local_api_available = nil
     return instance
 end
 
----Returns the base URL for the configured Zotero library.
+---Returns the base URL for the Zotero Web API.
 ---@return string
 function M:base_url()
     if self.__config.library_type == "group" then
@@ -45,7 +48,81 @@ function M:base_url()
     end
 end
 
----Makes an HTTP GET request to the Zotero API.
+---Returns the base URL for the Zotero local API.
+---User ID 0 means "the currently logged-in user".
+---@return string
+function M:local_base_url()
+    local port = self.__config.local_api_port or 23119
+    if self.__config.library_type == "group" then
+        return string.format("http://localhost:%d/api/groups/%s", port, self.__config.library_id)
+    else
+        return string.format("http://localhost:%d/api/users/0", port)
+    end
+end
+
+---Checks whether the Zotero local API is reachable (cached after first probe).
+---@return boolean
+function M:is_local_api_available()
+    if self.__local_api_available ~= nil then
+        return self.__local_api_available
+    end
+
+    local port = self.__config.local_api_port or 23119
+    local cmd = {
+        "curl", "-s", "-f",
+        "--connect-timeout", "2",
+        "--max-time", "3",
+        string.format("http://localhost:%d/api/", port),
+    }
+
+    vim.fn.system(cmd)
+    self.__local_api_available = (vim.v.shell_error == 0)
+    return self.__local_api_available
+end
+
+---Makes an HTTP GET request to the Zotero local API.
+---No authentication is required. No pagination is needed (the local API
+---returns all results by default).
+---@param path string #API path (appended to local base URL)
+---@param query? table<string,string> #optional query parameters
+---@return boolean success, any result
+function M:local_get(path, query)
+    local url = self:local_base_url() .. path
+
+    local cmd = {
+        "curl", "-s", "-f",
+        "--connect-timeout", "2",
+        "--max-time", "30",
+        "-H", "Zotero-API-Version: 3",
+    }
+
+    if query then
+        local parts = {}
+        for k, v in pairs(query) do
+            table.insert(parts, k .. "=" .. vim.uri_encode(v))
+        end
+        if #parts > 0 then
+            url = url .. "?" .. table.concat(parts, "&")
+        end
+    end
+
+    table.insert(cmd, url)
+
+    local result = vim.fn.system(cmd)
+
+    if vim.v.shell_error ~= 0 then
+        return false, "Local API request failed (exit code " .. vim.v.shell_error .. "): " .. result
+    end
+
+    local ok, decoded = pcall(vim.fn.json_decode, result)
+    if not ok then
+        return false, "Failed to decode JSON response: " .. result
+    end
+
+    return true, decoded
+end
+
+---Makes an HTTP GET request to the Zotero Web API.
 ---@param path string #API path (appended to base URL)
 ---@param query? table<string,string> #optional query parameters
 ---@return boolean success, any result
@@ -84,7 +161,24 @@ function M:get(path, query)
     return true, decoded
 end
 
----Makes an HTTP PATCH request to the Zotero API.
+---Makes a read request, preferring the local API when available.
+---Falls back to the web API if the local API is unreachable.
+---@param path string #API path
+---@param query? table<string,string> #optional query parameters
+---@return boolean success, any result
+function M:read(path, query)
+    if self.__config.prefer_local_api and self:is_local_api_available() then
+        local ok, result = self:local_get(path, query)
+        if ok then
+            return ok, result
+        end
+        -- Fall through to web API on local API failure
+    end
+    return self:get(path, query)
+end
+
+---Makes an HTTP PATCH request to the Zotero Web API.
+---Write requests are only supported via the web API.
 ---@param path string #API path (appended to base URL)
 ---@param body table #request body (will be JSON-encoded)
 ---@param version integer #If-Unmodified-Since-Version header value
@@ -125,9 +219,20 @@ function M:patch(path, body, version)
 end
 
 ---Fetches all top-level items from the Zotero library.
----Handles pagination via the Zotero API.
+---Uses the local API when available (no pagination needed); falls back to
+---the web API with pagination.
 ---@return boolean success, org-roam-zotero.ZoteroItem[]|string result
 function M:fetch_items()
+    -- Try the local API first: it returns all results without pagination
+    if self.__config.prefer_local_api and self:is_local_api_available() then
+        local ok, result = self:local_get("/items/top", { format = "json" })
+        if ok then
+            return true, result
+        end
+        -- Fall through to paginated web API
+    end
+
+    -- Web API: paginate through results
     local all_items = {}
     local start = 0
     local limit = 100
@@ -163,10 +268,11 @@ function M:fetch_items()
 end
 
 ---Fetches child items for a given item key.
+---Uses `read()` which prefers the local API.
 ---@param item_key string
 ---@return boolean success, org-roam-zotero.ZoteroItem[]|string result
 function M:fetch_children(item_key)
-    return self:get(string.format("/items/%s/children", item_key), {
+    return self:read(string.format("/items/%s/children", item_key), {
         format = "json",
     })
 end
@@ -191,6 +297,7 @@ function M:fetch_note(item_key)
 end
 
 ---Updates the content of a note item in Zotero.
+---Write requests always use the web API (local API is read-only).
 ---@param note_key string #key of the note item to update
 ---@param content string #new HTML content for the note
 ---@param version integer #current version for optimistic locking

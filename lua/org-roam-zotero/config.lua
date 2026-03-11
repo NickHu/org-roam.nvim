@@ -9,6 +9,8 @@
 ---@field library_type "user"|"group" #type of Zotero library to query
 ---@field library_id string #user or group ID for the Zotero library
 ---@field auto_sync boolean #if true, sync Zotero items after org-roam database loads
+---@field local_api_port integer #port for the Zotero local API (default 23119)
+---@field prefer_local_api boolean #if true, use the local API for read requests when available
 local M = {}
 M.__index = M
 
@@ -18,6 +20,8 @@ local DEFAULT = {
     library_type = "user",
     library_id = "",
     auto_sync = false,
+    local_api_port = 23119,
+    prefer_local_api = true,
 }
 
 ---Creates a new config instance.

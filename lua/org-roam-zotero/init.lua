@@ -34,7 +34,8 @@ local Range = require("org-roam.core.file.range")
 ---@field private __api org-roam-zotero.Api
 ---@field private __buffer org-roam-zotero.Buffer
 ---@field private __roam OrgRoam|nil
----@field private __synced_ids table<string, boolean> #track which node IDs we have synced
+---@field private __synced_nodes table<string, org-roam.core.file.Node> #nodes to re-insert after DB reloads
+---@field private __load_wrapped boolean #whether we have wrapped database:load()
 local M = {}
 M.__index = M
 
@@ -65,7 +66,8 @@ function M.setup(opts)
     instance.__api = api
     instance.__buffer = buffer
     instance.__roam = nil
-    instance.__synced_ids = {}
+    instance.__synced_nodes = {}
+    instance.__load_wrapped = false
 
     INSTANCE = instance
 
@@ -103,6 +105,61 @@ local function get_roam()
         INSTANCE.__roam = roam
     end
     return roam
+end
+
+---Re-inserts all tracked Zotero nodes into the org-roam database.
+---Called after database:load() to restore virtual nodes that were removed
+---because their zotero:// file paths don't exist on disk.
+---@param db org-roam.core.Database
+local function reinsert_nodes(db)
+    if not INSTANCE or vim.tbl_isempty(INSTANCE.__synced_nodes) then
+        return
+    end
+
+    for id, node in pairs(INSTANCE.__synced_nodes) do
+        if not db:has(id) then
+            db:insert(node, { id = id, overwrite = true })
+        end
+    end
+end
+
+---Wraps the org-roam database's load() method so that after every reload,
+---our virtual Zotero nodes are re-inserted.  This is necessary because
+---the loader compares files in the database against files on disk, and
+---removes any that are only in the database — which includes our
+---zotero:// URIs.
+---
+---The wrapper is installed once, on the database instance, so it does not
+---modify the Database class itself.
+local function ensure_load_wrapped()
+    if not INSTANCE or INSTANCE.__load_wrapped then
+        return
+    end
+
+    local roam = get_roam()
+    local db = roam.database
+
+    -- Capture the original load method from the metatable
+    local mt = getmetatable(db) or {}
+    local original_load = rawget(mt, "load")
+    if not original_load then
+        return
+    end
+
+    -- Store a wrapped version directly on the instance so the __index
+    -- metamethod finds it via rawget(self, key) before the metatable.
+    rawset(db, "load", function(self, opts)
+        return original_load(self, opts):next(function(result)
+            -- After the loader finishes, re-insert any missing Zotero nodes.
+            -- The result contains {database = core_db, files = ...}.
+            if result and result.database then
+                reinsert_nodes(result.database)
+            end
+            return result
+        end)
+    end)
+
+    INSTANCE.__load_wrapped = true
 end
 
 ---Creates an org-roam Node for a Zotero item + note pair.
@@ -185,13 +242,18 @@ function M.sync(opts)
                     version = note.data.version,
                 }
 
+                -- Track node for re-insertion after database reloads
+                INSTANCE.__synced_nodes[node.id] = node
+
                 -- Insert into org-roam database (overwrite if already present)
                 roam.database:insert(node, { overwrite = true }):wait()
-                INSTANCE.__synced_ids[node.id] = true
                 count = count + 1
             end
         end
     end
+
+    -- Install the load() wrapper so Zotero nodes survive future reloads
+    ensure_load_wrapped()
 
     vim.notify(
         string.format("org-roam-zotero: synced %d Zotero item(s)", count),
