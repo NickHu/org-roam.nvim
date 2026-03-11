@@ -303,7 +303,12 @@ function M.sync(opts)
 
     -- Always run in a coroutine so that API calls are non-blocking.
     local co = coroutine.create(do_sync)
-    coroutine.resume(co)
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        vim.schedule(function()
+            vim.notify("org-roam-zotero: sync error: " .. tostring(err), vim.log.levels.ERROR)
+        end)
+    end
 end
 
 ---Returns the current plugin instance (for testing/external use).

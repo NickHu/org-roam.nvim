@@ -102,8 +102,8 @@ function M.extract_org_links(text)
 
     local keys = {}
     -- Pattern: [[id:zotero-KEY]] or [[id:zotero-KEY][...]]
-    -- Capture KEY: everything after "zotero-" until the next "]"
-    for key in text:gmatch("%[%[id:zotero%-([^%]]+)%]") do
+    -- Capture KEY: everything after "zotero-" until the next "]" or "["
+    for key in text:gmatch("%[%[id:zotero%-([^%]%[]+)%]") do
         table.insert(keys, key)
     end
     return keys

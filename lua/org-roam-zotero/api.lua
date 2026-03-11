@@ -28,6 +28,9 @@ local function _exec(cmd)
             end)
         end)
         coroutine.yield()
+        if not result then
+            return "", -1
+        end
         return result.stdout or "", result.code
     else
         -- Sync/blocking path.
