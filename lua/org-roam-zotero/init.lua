@@ -302,7 +302,7 @@ function M.sync(opts)
             -- Collect related item keys from the parent item
             local related = extract_related_item_keys(item.data.relations)
             -- Also collect from the note if it exists
-            if note then
+            if note_ok and note then
                 local note_related = extract_related_item_keys(note.data.relations)
                 vim.list_extend(related, note_related)
             end
