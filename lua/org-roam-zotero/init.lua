@@ -119,6 +119,11 @@ local function reinsert_nodes(db)
     for id, node in pairs(INSTANCE.__synced_nodes) do
         if not db:has(id) then
             db:insert(node, { id = id, overwrite = true })
+            -- Re-establish links from the node's linked field
+            local linked_ids = vim.tbl_keys(node.linked)
+            if #linked_ids > 0 then
+                db:link(id, linked_ids)
+            end
         end
     end
 end
@@ -162,6 +167,36 @@ local function ensure_load_wrapped()
     INSTANCE.__load_wrapped = true
 end
 
+---Extracts Zotero item keys from the `dc:relation` relations of a Zotero item.
+---Relations are URIs like "http://zotero.org/users/123/items/ABCDEF".
+---@param relations table<string, string|string[]>|nil
+---@return string[] item_keys
+local function extract_related_keys(relations)
+    if not relations then
+        return {}
+    end
+
+    local keys = {}
+    local uris = relations["dc:relation"]
+    if not uris then
+        return keys
+    end
+
+    -- dc:relation can be a single string or an array
+    if type(uris) == "string" then
+        uris = { uris }
+    end
+
+    for _, uri in ipairs(uris) do
+        local item_key = uri:match("/items/([^/]+)$")
+        if item_key then
+            table.insert(keys, item_key)
+        end
+    end
+
+    return keys
+end
+
 ---Creates an org-roam Node for a Zotero item + note pair.
 ---@param item org-roam-zotero.ZoteroItem
 ---@param note org-roam-zotero.ZoteroItem
@@ -203,8 +238,10 @@ end
 ---Synchronises Zotero items into the org-roam database.
 ---
 ---Fetches all top-level items from the configured Zotero library, finds
----those with at least one `note` child, and inserts a virtual node for each
----into the org-roam database.
+---those with at least one `note` child tagged "org-roam" (creating one if
+---needed), and inserts a virtual node for each into the org-roam database.
+---
+---Zotero "related" items are synchronised as org-roam links between nodes.
 ---
 ---@param opts? {on_done?:fun(count:integer)}
 function M.sync(opts)
@@ -229,6 +266,11 @@ function M.sync(opts)
     local roam = get_roam()
     local count = 0
 
+    -- Two-pass sync: first create all nodes, then resolve relations as links.
+    -- Pass 1: create nodes and build item_key -> node_id mapping
+    local nodes_by_item_key = {} ---@type table<string, string>
+    local item_relations = {}    ---@type table<string, string[]>
+
     for _, item in ipairs(items) do
         -- Skip attachments, notes, etc. at the top level
         if item.data.itemType ~= "attachment" and item.data.itemType ~= "note" then
@@ -245,9 +287,41 @@ function M.sync(opts)
                 -- Track node for re-insertion after database reloads
                 INSTANCE.__synced_nodes[node.id] = node
 
+                -- Build item_key -> node_id mapping for relation resolution
+                nodes_by_item_key[item.data.key] = node.id
+
+                -- Collect related item keys from both parent item and note
+                local related = extract_related_keys(item.data.relations)
+                local note_related = extract_related_keys(note.data.relations)
+                for _, key in ipairs(note_related) do
+                    table.insert(related, key)
+                end
+                if #related > 0 then
+                    item_relations[node.id] = related
+                end
+
                 -- Insert into org-roam database (overwrite if already present)
                 roam.database:insert(node, { overwrite = true }):wait()
                 count = count + 1
+            end
+        end
+    end
+
+    -- Pass 2: resolve Zotero relations as org-roam links between nodes
+    for node_id, related_keys in pairs(item_relations) do
+        local node = INSTANCE.__synced_nodes[node_id]
+        if node then
+            local linked = {}
+            for _, related_key in ipairs(related_keys) do
+                local related_node_id = nodes_by_item_key[related_key]
+                if related_node_id then
+                    linked[related_node_id] = {}
+                end
+            end
+            if not vim.tbl_isempty(linked) then
+                node.linked = linked
+                -- Establish links in the database graph
+                roam.database:link(node.id, vim.tbl_keys(linked))
             end
         end
     end
@@ -275,5 +349,8 @@ end
 function M.reset()
     INSTANCE = nil
 end
+
+-- Expose internal helpers for testing
+M._extract_related_keys = extract_related_keys
 
 return M

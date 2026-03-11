@@ -2,6 +2,7 @@ describe("org-roam-zotero", function()
     local Buffer = require("org-roam-zotero.buffer")
     local Config = require("org-roam-zotero.config")
     local Api = require("org-roam-zotero.api")
+    local ZoteroPlugin = require("org-roam-zotero")
 
     describe("config", function()
         it("should use defaults when no options are given", function()
@@ -65,6 +66,45 @@ describe("org-roam-zotero", function()
             local config = Config:new({ library_type = "user", library_id = "123", local_api_port = 9999 })
             local api = Api:new(config)
             assert.are.equal("http://localhost:9999/api/users/0", api:local_base_url())
+        end)
+    end)
+
+    describe("extract_related_keys", function()
+        it("should return empty table for nil relations", function()
+            local keys = ZoteroPlugin._extract_related_keys(nil)
+            assert.are.same({}, keys)
+        end)
+
+        it("should return empty table when no dc:relation key", function()
+            local keys = ZoteroPlugin._extract_related_keys({ other = "value" })
+            assert.are.same({}, keys)
+        end)
+
+        it("should extract item key from a single relation URI", function()
+            local keys = ZoteroPlugin._extract_related_keys({
+                ["dc:relation"] = "http://zotero.org/users/12345/items/ABCDEF",
+            })
+            assert.are.same({ "ABCDEF" }, keys)
+        end)
+
+        it("should extract item keys from an array of relation URIs", function()
+            local keys = ZoteroPlugin._extract_related_keys({
+                ["dc:relation"] = {
+                    "http://zotero.org/users/12345/items/AAA111",
+                    "http://zotero.org/groups/67890/items/BBB222",
+                },
+            })
+            assert.are.same({ "AAA111", "BBB222" }, keys)
+        end)
+
+        it("should ignore URIs that don't match the /items/ pattern", function()
+            local keys = ZoteroPlugin._extract_related_keys({
+                ["dc:relation"] = {
+                    "http://zotero.org/users/12345/items/VALID",
+                    "http://example.com/not-a-zotero-uri",
+                },
+            })
+            assert.are.same({ "VALID" }, keys)
         end)
     end)
 
@@ -390,7 +430,6 @@ describe("org-roam-zotero", function()
 
         it("should preserve Zotero nodes across database reloads", function()
             local roam = utils.init_plugin({ setup = true })
-            local ZoteroPlugin = require("org-roam-zotero")
 
             roam.database:load():wait()
 
@@ -483,6 +522,61 @@ describe("org-roam-zotero", function()
             local results = roam.database:find_nodes_by_title_sync("Unique Zotero Title For Find")
             assert.are.equal(1, #results)
             assert.are.equal("zotero-TITLE-FIND", results[1].id)
+        end)
+
+        it("should establish links between related Zotero nodes", function()
+            local roam = utils.init_plugin({ setup = true })
+
+            roam.database:load():wait()
+
+            -- Create two nodes that are "related" in Zotero
+            local node_a = Node:new({
+                id = "zotero-ITEMA-NOTEA",
+                origin = "zotero://ITEMA",
+                range = Range:new(
+                    { row = 0, column = 0, offset = 0 },
+                    { row = 0, column = 0, offset = 0 }
+                ),
+                file = "zotero://ITEMA/NOTEA",
+                mtime = 0,
+                title = "Paper A",
+                aliases = {},
+                tags = { "zotero" },
+                level = 0,
+                linked = { ["zotero-ITEMB-NOTEB"] = {} },
+            })
+
+            local node_b = Node:new({
+                id = "zotero-ITEMB-NOTEB",
+                origin = "zotero://ITEMB",
+                range = Range:new(
+                    { row = 0, column = 0, offset = 0 },
+                    { row = 0, column = 0, offset = 0 }
+                ),
+                file = "zotero://ITEMB/NOTEB",
+                mtime = 0,
+                title = "Paper B",
+                aliases = {},
+                tags = { "zotero" },
+                level = 0,
+                linked = { ["zotero-ITEMA-NOTEA"] = {} },
+            })
+
+            -- Insert both nodes
+            roam.database:insert(node_a, { overwrite = true }):wait()
+            roam.database:insert(node_b, { overwrite = true }):wait()
+
+            -- Establish links (as sync() pass 2 would do)
+            roam.database:link("zotero-ITEMA-NOTEA", { "zotero-ITEMB-NOTEB" })
+            roam.database:link("zotero-ITEMB-NOTEB", { "zotero-ITEMA-NOTEA" })
+
+            -- Verify node A links to node B (via the core database)
+            local links_a = roam.database:get_links("zotero-ITEMA-NOTEA")
+            assert.is_not_nil(links_a["zotero-ITEMB-NOTEB"])
+
+            -- Verify node B has backlink from node A
+            local backlinks_b = roam.database:get_backlinks("zotero-ITEMB-NOTEB")
+            assert.is_not_nil(backlinks_b["zotero-ITEMA-NOTEA"])
         end)
     end)
 end)

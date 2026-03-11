@@ -276,7 +276,7 @@ function M:__on_buf_read(buf, uri)
     end
 
     -- Fetch the note directly to get fresh content
-    local ok_get, note_data = self.__api:read(
+    local ok_get, note_resp = self.__api:read(
         string.format("/items/%s", note_key),
         { format = "json" }
     )
@@ -285,20 +285,21 @@ function M:__on_buf_read(buf, uri)
         return
     end
 
-    ---@cast note_data org-roam-zotero.ZoteroItemData
-    local note_html = note_data.note or ""
-    local version = note_data.version or cached.version
+    ---@cast note_resp org-roam-zotero.ZoteroItem
+    local data = note_resp.data or {}
+    local note_html = data.note or ""
+    local version = note_resp.version or cached.version
 
     -- Try to get the parent item's title
     local title = note_key
-    if note_data.parentItem then
-        local ok_parent, parent_data = self.__api:read(
-            string.format("/items/%s", note_data.parentItem),
+    if data.parentItem then
+        local ok_parent, parent_resp = self.__api:read(
+            string.format("/items/%s", data.parentItem),
             { format = "json" }
         )
-        if ok_parent and parent_data then
-            ---@cast parent_data org-roam-zotero.ZoteroItemData
-            title = parent_data.title or title
+        if ok_parent and parent_resp then
+            ---@cast parent_resp org-roam-zotero.ZoteroItem
+            title = (parent_resp.data or {}).title or title
         end
     end
 

@@ -26,6 +26,7 @@ M.__index = M
 ---@field note? string
 ---@field parentItem? string
 ---@field creators? {creatorType:string, firstName?:string, lastName?:string, name?:string}[]
+---@field relations? table<string, string|string[]>
 
 ---Creates a new API client.
 ---@param config org-roam-zotero.Config
@@ -218,6 +219,43 @@ function M:patch(path, body, version)
     return true, decoded
 end
 
+---Makes an HTTP POST request to the Zotero Web API.
+---Write requests are only supported via the web API.
+---@param path string #API path (appended to base URL)
+---@param body table #request body (will be JSON-encoded)
+---@return boolean success, any result
+function M:post(path, body)
+    local url = self:base_url() .. path
+    local json_body = vim.fn.json_encode(body)
+
+    local cmd = {
+        "curl", "-s", "-f",
+        "-X", "POST",
+        "-H", "Zotero-API-Key: " .. self.__config.api_key,
+        "-H", "Zotero-API-Version: 3",
+        "-H", "Content-Type: application/json",
+        "-d", json_body,
+        url,
+    }
+
+    local result = vim.fn.system(cmd)
+
+    if vim.v.shell_error ~= 0 then
+        return false, "HTTP POST failed (exit code " .. vim.v.shell_error .. "): " .. result
+    end
+
+    if result == "" then
+        return true, nil
+    end
+
+    local ok, decoded = pcall(vim.fn.json_decode, result)
+    if not ok then
+        return true, result
+    end
+
+    return true, decoded
+end
+
 ---Fetches all top-level items from the Zotero library.
 ---Uses the local API when available (no pagination needed); falls back to
 ---the web API with pagination.
@@ -277,7 +315,38 @@ function M:fetch_children(item_key)
     })
 end
 
----Fetches the first note child for a given item key.
+---Creates a new child note tagged "org-roam" for the given parent item.
+---Write requests always use the web API (local API is read-only).
+---@param parent_item_key string
+---@return boolean success, org-roam-zotero.ZoteroItem|string result
+function M:create_note(parent_item_key)
+    local items = {
+        {
+            itemType = "note",
+            parentItem = parent_item_key,
+            note = "",
+            tags = { { tag = "org-roam" } },
+        },
+    }
+
+    local ok, result = self:post("/items", items)
+    if not ok then
+        return false, result
+    end
+
+    -- Parse the multi-object creation response
+    if type(result) == "table" and result.successful then
+        local first = result.successful["0"] or result.successful[0]
+        if first then
+            return true, first
+        end
+    end
+
+    return false, "Failed to create note: unexpected response"
+end
+
+---Fetches the first child note tagged "org-roam" for a given item key.
+---If no such note exists, creates one via the web API.
 ---@param item_key string
 ---@return boolean success, org-roam-zotero.ZoteroItem|nil|string result
 function M:fetch_note(item_key)
@@ -289,11 +358,19 @@ function M:fetch_note(item_key)
     ---@cast children org-roam-zotero.ZoteroItem[]
     for _, child in ipairs(children) do
         if child.data and child.data.itemType == "note" then
-            return true, child
+            -- Check for the "org-roam" tag
+            if child.data.tags then
+                for _, t in ipairs(child.data.tags) do
+                    if t.tag == "org-roam" then
+                        return true, child
+                    end
+                end
+            end
         end
     end
 
-    return true, nil
+    -- No org-roam-tagged note found; create one
+    return self:create_note(item_key)
 end
 
 ---Updates the content of a note item in Zotero.
