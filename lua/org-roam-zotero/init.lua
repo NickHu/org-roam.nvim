@@ -18,7 +18,7 @@
 -- on the child note.
 --
 -- Sync runs automatically on OrgRoamInitialized (asynchronously via
--- coroutines) and can also be triggered manually with :ZoteroSync.
+-- plenary.async) and can also be triggered manually with :ZoteroSync.
 --
 -- Usage:
 --   require("org-roam-zotero").setup({
@@ -223,8 +223,8 @@ end
 ---for the buffer handler; otherwise the note is created lazily on first
 ---write from the ephemeral buffer.
 ---
----The call is always wrapped in a coroutine so that the underlying curl
----requests are non-blocking (they use `vim.system()` and yield).
+---The call is wrapped with `plenary.async` so that the underlying
+---plenary.curl requests are non-blocking.
 ---
 ---Relations are *not* read from Zotero here.  Instead, when a virtual
 ---node's buffer is written, the links found in the body are pushed to
@@ -238,58 +238,58 @@ function M.sync(opts)
         return
     end
 
-    local function do_sync()
-        local api = INSTANCE.__api
+    local async = require("plenary.async")
 
-        vim.schedule(function()
+    async.void(function()
+        local ok, err = pcall(function()
+            async.util.scheduler()
             vim.notify("org-roam-zotero: syncing Zotero items…", vim.log.levels.INFO)
-        end)
 
-        -- Fetch items (non-blocking inside a coroutine via _exec)
-        local ok, items = api:fetch_items()
-        if not ok then
-            vim.schedule(function()
+            local api = INSTANCE.__api
+
+            -- Fetch items (non-blocking inside plenary.async coroutine)
+            local fetch_ok, items = api:fetch_items()
+            if not fetch_ok then
+                async.util.scheduler()
                 vim.notify("org-roam-zotero: failed to fetch items: " .. tostring(items), vim.log.levels.ERROR)
-            end)
-            return
-        end
+                return
+            end
 
-        ---@cast items org-roam-zotero.ZoteroItem[]
-        local count = 0
+            ---@cast items org-roam-zotero.ZoteroItem[]
+            local count = 0
 
-        for _, item in ipairs(items) do
-            -- Skip attachments, notes, etc. at the top level
-            if item.data.itemType ~= "attachment" and item.data.itemType ~= "note" then
-                local node = make_node(item, INSTANCE.__config)
+            for _, item in ipairs(items) do
+                -- Skip attachments, notes, etc. at the top level
+                if item.data.itemType ~= "attachment" and item.data.itemType ~= "note" then
+                    local node = make_node(item, INSTANCE.__config)
 
-                -- Try to find an existing org-roam note (but don't create one)
-                local note_ok, note = api:fetch_note(item.data.key)
-                if note_ok and note then
-                    ---@cast note org-roam-zotero.ZoteroItem
-                    -- Cache note metadata for the buffer handler
-                    INSTANCE.__buffer.__note_cache[item.data.key] = {
-                        note_key = note.data.key,
-                        version = note.data.version,
-                    }
-                end
-                -- If no note exists, the cache entry stays nil; note is created
-                -- on first write from the ephemeral buffer.
+                    -- Try to find an existing org-roam note (but don't create one)
+                    local note_ok, note = api:fetch_note(item.data.key)
+                    if note_ok and note then
+                        ---@cast note org-roam-zotero.ZoteroItem
+                        -- Cache note metadata for the buffer handler
+                        INSTANCE.__buffer.__note_cache[item.data.key] = {
+                            note_key = note.data.key,
+                            version = note.data.version,
+                        }
+                    end
+                    -- If no note exists, the cache entry stays nil; note is created
+                    -- on first write from the ephemeral buffer.
 
-                -- Track node for re-insertion after database reloads
-                INSTANCE.__synced_nodes[node.id] = node
+                    -- Track node for re-insertion after database reloads
+                    INSTANCE.__synced_nodes[node.id] = node
 
-                -- Insert into org-roam database (overwrite if already present).
-                -- Database operations are fast (in-memory), schedule to main thread.
-                vim.schedule(function()
+                    -- Insert into org-roam database (overwrite if already present).
+                    async.util.scheduler()
                     local roam = get_roam()
                     roam.database:insert(node, { overwrite = true }):wait()
-                end)
-                count = count + 1
-            end
-        end
 
-        -- Install the load() wrapper so Zotero nodes survive future reloads
-        vim.schedule(function()
+                    count = count + 1
+                end
+            end
+
+            -- Install the load() wrapper so Zotero nodes survive future reloads
+            async.util.scheduler()
             ensure_load_wrapped()
             vim.notify(
                 string.format("org-roam-zotero: synced %d Zotero item(s)", count),
@@ -299,16 +299,12 @@ function M.sync(opts)
                 opts.on_done(count)
             end
         end)
-    end
 
-    -- Always run in a coroutine so that API calls are non-blocking.
-    local co = coroutine.create(do_sync)
-    local ok, err = coroutine.resume(co)
-    if not ok then
-        vim.schedule(function()
+        if not ok then
+            async.util.scheduler()
             vim.notify("org-roam-zotero: sync error: " .. tostring(err), vim.log.levels.ERROR)
-        end)
-    end
+        end
+    end)()
 end
 
 ---Returns the current plugin instance (for testing/external use).

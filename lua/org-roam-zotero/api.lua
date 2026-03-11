@@ -4,39 +4,72 @@
 -- Zotero Web API v3 and local API client.
 -- See https://www.zotero.org/support/dev/web_api/v3/basics
 -- Local API: https://github.com/zotero/zotero/blob/8.0/chrome/content/zotero/xpcom/server/server_localAPI.js
+--
+-- HTTP requests use plenary.curl.  When called from inside a
+-- plenary.async coroutine (e.g. the background sync), the requests are
+-- non-blocking; otherwise they run synchronously.
 -------------------------------------------------------------------------------
 
----Executes a system command.
+local curl = require("plenary.curl")
+local async = require("plenary.async")
+
+---Makes an HTTP request via plenary.curl.
 ---
----When called from inside a coroutine the call is non-blocking: it uses
----`vim.system()` with a callback and yields until the process exits.
----Otherwise it falls back to the blocking `vim.fn.system()`.
+---When called from inside a coroutine the request runs asynchronously
+---(plenary.curl with callback, yielded via async.wrap); otherwise it
+---blocks.  Non-zero curl exit codes are caught via `on_error` so that
+---plenary.curl does not throw.
 ---
----@param cmd string[]
----@return string stdout, integer exit_code
-local function _exec(cmd)
-    local co = coroutine.running()
-    if co then
-        -- Async path: fire-and-forget via vim.system, yield until done.
-        local result
-        vim.system(cmd, { text = true }, function(obj)
-            result = obj
-            vim.schedule(function()
-                if coroutine.status(co) == "suspended" then
-                    coroutine.resume(co)
-                end
-            end)
-        end)
-        coroutine.yield()
-        if not result then
-            return "", -1
-        end
-        return result.stdout or "", result.code
-    else
-        -- Sync/blocking path.
-        local output = vim.fn.system(cmd)
-        return output, vim.v.shell_error
+---@param method string  "get"|"post"|"patch"
+---@param url string
+---@param opts? table    plenary.curl options (headers, body, raw, …)
+---@return {exit:integer, status:integer?, headers:table?, body:string?}
+local function _request(method, url, opts)
+    opts = opts or {}
+    -- Prevent plenary.curl from throwing on non-zero curl exit codes
+    -- (e.g. connection refused).  Instead, return an error table.
+    opts.on_error = opts.on_error or function(err)
+        return err
     end
+
+    if coroutine.running() then
+        -- Non-blocking path: wrap the callback-based plenary.curl call
+        -- so that plenary.async can yield / resume properly.
+        return async.wrap(function(callback)
+            local copts = vim.tbl_deep_extend("force", {}, opts, { callback = callback })
+            curl[method](url, copts)
+        end, 1)()
+    else
+        return curl[method](url, opts)
+    end
+end
+
+---Decodes a plenary.curl response as JSON.
+---@param response table|nil  plenary.curl response
+---@param label string        human-readable label for error messages
+---@return boolean success, any result
+local function _decode_response(response, label)
+    if not response then
+        return false, label .. " failed: no response"
+    end
+    -- plenary.curl on_error returns {message, stderr, exit}
+    if response.message then
+        return false, label .. " failed: " .. response.message
+    end
+    if response.exit and response.exit ~= 0 then
+        return false, label .. " failed (exit " .. response.exit .. "): " .. (response.body or "")
+    end
+    if response.status and response.status >= 400 then
+        return false, label .. " failed (status " .. response.status .. "): " .. (response.body or "")
+    end
+    if not response.body or response.body == "" then
+        return true, nil
+    end
+    local ok, decoded = pcall(vim.fn.json_decode, response.body)
+    if not ok then
+        return false, "Failed to decode JSON response: " .. (response.body or "")
+    end
+    return true, decoded
 end
 
 ---@class org-roam-zotero.Api
@@ -102,15 +135,11 @@ function M:is_local_api_available()
     end
 
     local port = self.__config.local_api_port or 23119
-    local cmd = {
-        "curl", "-s", "-f",
-        "--connect-timeout", "2",
-        "--max-time", "3",
-        string.format("http://localhost:%d/api/", port),
-    }
-
-    local _, exit_code = _exec(cmd)
-    self.__local_api_available = (exit_code == 0)
+    local url = string.format("http://localhost:%d/api/", port)
+    local response = _request("get", url, {
+        raw = { "--connect-timeout", "2", "--max-time", "3" },
+    })
+    self.__local_api_available = (response ~= nil and not response.message and response.exit == 0)
     return self.__local_api_available
 end
 
@@ -121,39 +150,12 @@ end
 ---@param query? table<string,string> #optional query parameters
 ---@return boolean success, any result
 function M:local_get(path, query)
-    local url = self:local_base_url() .. path
-
-    local cmd = {
-        "curl", "-s", "-f",
-        "--connect-timeout", "2",
-        "--max-time", "30",
-        "-H", "Zotero-API-Version: 3",
-    }
-
-    if query then
-        local parts = {}
-        for k, v in pairs(query) do
-            table.insert(parts, k .. "=" .. vim.uri_encode(v))
-        end
-        if #parts > 0 then
-            url = url .. "?" .. table.concat(parts, "&")
-        end
-    end
-
-    table.insert(cmd, url)
-
-    local result, exit_code = _exec(cmd)
-
-    if exit_code ~= 0 then
-        return false, "Local API request failed (exit code " .. exit_code .. "): " .. result
-    end
-
-    local ok, decoded = pcall(vim.fn.json_decode, result)
-    if not ok then
-        return false, "Failed to decode JSON response: " .. result
-    end
-
-    return true, decoded
+    local response = _request("get", self:local_base_url() .. path, {
+        headers = { zotero_api_version = "3" },
+        query = query,
+        raw = { "--connect-timeout", "2", "--max-time", "30" },
+    })
+    return _decode_response(response, "Local API request")
 end
 
 ---Makes an HTTP GET request to the Zotero Web API.
@@ -161,38 +163,14 @@ end
 ---@param query? table<string,string> #optional query parameters
 ---@return boolean success, any result
 function M:get(path, query)
-    local url = self:base_url() .. path
-
-    local cmd = {
-        "curl", "-s", "-f",
-        "-H", "Zotero-API-Key: " .. self.__config.api_key,
-        "-H", "Zotero-API-Version: 3",
-    }
-
-    if query then
-        local parts = {}
-        for k, v in pairs(query) do
-            table.insert(parts, k .. "=" .. vim.uri_encode(v))
-        end
-        if #parts > 0 then
-            url = url .. "?" .. table.concat(parts, "&")
-        end
-    end
-
-    table.insert(cmd, url)
-
-    local result, exit_code = _exec(cmd)
-
-    if exit_code ~= 0 then
-        return false, "HTTP request failed (exit code " .. exit_code .. "): " .. result
-    end
-
-    local ok, decoded = pcall(vim.fn.json_decode, result)
-    if not ok then
-        return false, "Failed to decode JSON response: " .. result
-    end
-
-    return true, decoded
+    local response = _request("get", self:base_url() .. path, {
+        headers = {
+            zotero_api_key = self.__config.api_key,
+            zotero_api_version = "3",
+        },
+        query = query,
+    })
+    return _decode_response(response, "HTTP request")
 end
 
 ---Makes a read request, preferring the local API when available.
@@ -218,38 +196,16 @@ end
 ---@param version integer #If-Unmodified-Since-Version header value
 ---@return boolean success, any result
 function M:patch(path, body, version)
-    local url = self:base_url() .. path
-    local json_body = vim.fn.json_encode(body)
-
-    local cmd = {
-        "curl", "-s", "-f",
-        "-X", "PATCH",
-        "-H", "Zotero-API-Key: " .. self.__config.api_key,
-        "-H", "Zotero-API-Version: 3",
-        "-H", "Content-Type: application/json",
-        "-H", "If-Unmodified-Since-Version: " .. tostring(version),
-        "-d", json_body,
-        url,
-    }
-
-    local result, exit_code = _exec(cmd)
-
-    if exit_code ~= 0 then
-        return false, "HTTP PATCH failed (exit code " .. exit_code .. "): " .. result
-    end
-
-    -- PATCH may return empty body on success (204)
-    if result == "" then
-        return true, nil
-    end
-
-    local ok, decoded = pcall(vim.fn.json_decode, result)
-    if not ok then
-        -- Might be a non-JSON success response
-        return true, result
-    end
-
-    return true, decoded
+    local response = _request("patch", self:base_url() .. path, {
+        headers = {
+            zotero_api_key = self.__config.api_key,
+            zotero_api_version = "3",
+            content_type = "application/json",
+            if_unmodified_since_version = tostring(version),
+        },
+        body = vim.fn.json_encode(body),
+    })
+    return _decode_response(response, "HTTP PATCH")
 end
 
 ---Makes an HTTP POST request to the Zotero Web API.
@@ -258,35 +214,15 @@ end
 ---@param body table #request body (will be JSON-encoded)
 ---@return boolean success, any result
 function M:post(path, body)
-    local url = self:base_url() .. path
-    local json_body = vim.fn.json_encode(body)
-
-    local cmd = {
-        "curl", "-s", "-f",
-        "-X", "POST",
-        "-H", "Zotero-API-Key: " .. self.__config.api_key,
-        "-H", "Zotero-API-Version: 3",
-        "-H", "Content-Type: application/json",
-        "-d", json_body,
-        url,
-    }
-
-    local result, exit_code = _exec(cmd)
-
-    if exit_code ~= 0 then
-        return false, "HTTP POST failed (exit code " .. exit_code .. "): " .. result
-    end
-
-    if result == "" then
-        return true, nil
-    end
-
-    local ok, decoded = pcall(vim.fn.json_decode, result)
-    if not ok then
-        return true, result
-    end
-
-    return true, decoded
+    local response = _request("post", self:base_url() .. path, {
+        headers = {
+            zotero_api_key = self.__config.api_key,
+            zotero_api_version = "3",
+            content_type = "application/json",
+        },
+        body = vim.fn.json_encode(body),
+    })
+    return _decode_response(response, "HTTP POST")
 end
 
 ---Fetches all top-level items from the Zotero library.
