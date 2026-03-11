@@ -5,69 +5,31 @@
 -- See https://www.zotero.org/support/dev/web_api/v3/basics
 -- Local API: https://github.com/zotero/zotero/blob/8.0/chrome/content/zotero/xpcom/server/server_localAPI.js
 --
--- HTTP requests use plenary.curl.  When called from inside a
--- plenary.async coroutine (e.g. the background sync), the requests are
--- non-blocking; otherwise they run synchronously.
+-- HTTP requests use plenary.curl (synchronous).
 -------------------------------------------------------------------------------
 
 local curl = require("plenary.curl")
-local async = require("plenary.async")
 
----Makes an HTTP request via plenary.curl.
----
----When called from inside a coroutine the request runs asynchronously
----(plenary.curl with callback, yielded via async.wrap); otherwise it
----blocks.  Non-zero curl exit codes are caught via `on_error` so that
----plenary.curl does not throw.
----
----@param method string  "get"|"post"|"patch"
----@param url string
----@param opts? table    plenary.curl options (headers, body, raw, …)
----@return {exit:integer, status:integer?, headers:table?, body:string?}
-local function _request(method, url, opts)
-    opts = opts or {}
-    -- Prevent plenary.curl from throwing on non-zero curl exit codes
-    -- (e.g. connection refused).  Instead, return an error table.
-    opts.on_error = opts.on_error or function(err)
-        return err
-    end
+-- Passed as `on_error` to every plenary.curl call to suppress its default
+-- `error()` throw on non-zero curl exit codes.
+local function _noop() end
 
-    if coroutine.running() then
-        -- Non-blocking path: wrap the callback-based plenary.curl call
-        -- so that plenary.async can yield / resume properly.
-        return async.wrap(function(callback)
-            local copts = vim.tbl_deep_extend("force", {}, opts, { callback = callback })
-            curl[method](url, copts)
-        end, 1)()
-    else
-        return curl[method](url, opts)
-    end
-end
-
----Decodes a plenary.curl response as JSON.
----@param response table|nil  plenary.curl response
----@param label string        human-readable label for error messages
----@return boolean success, any result
-local function _decode_response(response, label)
-    if not response then
-        return false, label .. " failed: no response"
-    end
-    -- plenary.curl on_error returns {message, stderr, exit}
-    if response.message then
-        return false, label .. " failed: " .. response.message
-    end
-    if response.exit and response.exit ~= 0 then
-        return false, label .. " failed (exit " .. response.exit .. "): " .. (response.body or "")
-    end
+---Decodes the body of a plenary.curl response as JSON.
+---Returns (true, decoded_table) on success, (false, error_string) on failure.
+---An empty or whitespace-only body is treated as nil (not an error).
+---@param response table  plenary.curl response {exit, status, headers, body}
+---@return boolean, any
+local function _decode_json(response)
     if response.status and response.status >= 400 then
-        return false, label .. " failed (status " .. response.status .. "): " .. (response.body or "")
+        return false, string.format("HTTP %d: %s", response.status, response.body or "")
     end
-    if not response.body or response.body == "" then
+    local body = vim.trim(response.body or "")
+    if body == "" then
         return true, nil
     end
-    local ok, decoded = pcall(vim.fn.json_decode, response.body)
+    local ok, decoded = pcall(vim.json.decode, body)
     if not ok then
-        return false, "Failed to decode JSON response: " .. (response.body or "")
+        return false, "JSON decode error: " .. tostring(decoded)
     end
     return true, decoded
 end
@@ -136,10 +98,11 @@ function M:is_local_api_available()
 
     local port = self.__config.local_api_port or 23119
     local url = string.format("http://localhost:%d/api/", port)
-    local response = _request("get", url, {
+    local response = curl.get(url, {
         raw = { "--connect-timeout", "2", "--max-time", "3" },
+        on_error = _noop,
     })
-    self.__local_api_available = (response ~= nil and not response.message and response.exit == 0)
+    self.__local_api_available = response ~= nil and response.status ~= nil and response.status > 0
     return self.__local_api_available
 end
 
@@ -150,12 +113,16 @@ end
 ---@param query? table<string,string> #optional query parameters
 ---@return boolean success, any result
 function M:local_get(path, query)
-    local response = _request("get", self:local_base_url() .. path, {
+    local response = curl.get(self:local_base_url() .. path, {
         headers = { ["Zotero-API-Version"] = "3" },
         query = query,
         raw = { "--connect-timeout", "2", "--max-time", "30" },
+        on_error = _noop,
     })
-    return _decode_response(response, "Local API request")
+    if not response or not response.status then
+        return false, "Local API request failed"
+    end
+    return _decode_json(response)
 end
 
 ---Makes an HTTP GET request to the Zotero Web API.
@@ -163,14 +130,18 @@ end
 ---@param query? table<string,string> #optional query parameters
 ---@return boolean success, any result
 function M:get(path, query)
-    local response = _request("get", self:base_url() .. path, {
+    local response = curl.get(self:base_url() .. path, {
         headers = {
             ["Zotero-API-Key"] = self.__config.api_key,
             ["Zotero-API-Version"] = "3",
         },
         query = query,
+        on_error = _noop,
     })
-    return _decode_response(response, "HTTP request")
+    if not response or not response.status then
+        return false, "HTTP request failed"
+    end
+    return _decode_json(response)
 end
 
 ---Makes a read request, preferring the local API when available.
@@ -196,7 +167,7 @@ end
 ---@param version integer #If-Unmodified-Since-Version header value
 ---@return boolean success, any result
 function M:patch(path, body, version)
-    local response = _request("patch", self:base_url() .. path, {
+    local response = curl.patch(self:base_url() .. path, {
         headers = {
             ["Zotero-API-Key"] = self.__config.api_key,
             ["Zotero-API-Version"] = "3",
@@ -204,8 +175,12 @@ function M:patch(path, body, version)
             ["If-Unmodified-Since-Version"] = tostring(version),
         },
         body = vim.fn.json_encode(body),
+        on_error = _noop,
     })
-    return _decode_response(response, "HTTP PATCH")
+    if not response or not response.status then
+        return false, "HTTP PATCH failed"
+    end
+    return _decode_json(response)
 end
 
 ---Makes an HTTP POST request to the Zotero Web API.
@@ -214,15 +189,19 @@ end
 ---@param body table #request body (will be JSON-encoded)
 ---@return boolean success, any result
 function M:post(path, body)
-    local response = _request("post", self:base_url() .. path, {
+    local response = curl.post(self:base_url() .. path, {
         headers = {
             ["Zotero-API-Key"] = self.__config.api_key,
             ["Zotero-API-Version"] = "3",
             ["Content-Type"] = "application/json",
         },
         body = vim.fn.json_encode(body),
+        on_error = _noop,
     })
-    return _decode_response(response, "HTTP POST")
+    if not response or not response.status then
+        return false, "HTTP POST failed"
+    end
+    return _decode_json(response)
 end
 
 ---Fetches all top-level items from the Zotero library.
@@ -305,7 +284,7 @@ function M:create_note(parent_item_key)
 
     -- Parse the multi-object creation response.
     -- Zotero API v3 returns string keys ("0", "1", ...) in the successful
-    -- object; vim.fn.json_decode preserves them as string keys, but we check
+    -- object; vim.json.decode preserves them as string keys, but we check
     -- both representations for robustness.
     if type(result) == "table" and result.successful then
         local first = result.successful["0"] or result.successful[0]

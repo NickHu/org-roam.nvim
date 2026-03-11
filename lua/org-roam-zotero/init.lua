@@ -223,8 +223,8 @@ end
 ---for the buffer handler; otherwise the note is created lazily on first
 ---write from the ephemeral buffer.
 ---
----The call is wrapped with `plenary.async` so that the underlying
----plenary.curl requests are non-blocking.
+---The sync is run inside `plenary.async.void` so that `vim.notify` calls
+---and database operations can be scheduled back onto the main thread.
 ---
 ---Relations are *not* read from Zotero here.  Instead, when a virtual
 ---node's buffer is written, the links found in the body are pushed to
@@ -247,7 +247,7 @@ function M.sync(opts)
 
             local api = INSTANCE.__api
 
-            -- Fetch items (non-blocking inside plenary.async coroutine)
+            -- Fetch items
             local fetch_ok, items = api:fetch_items()
             if not fetch_ok then
                 async.util.scheduler()
