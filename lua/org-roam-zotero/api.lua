@@ -151,7 +151,7 @@ end
 ---@return boolean success, any result
 function M:local_get(path, query)
     local response = _request("get", self:local_base_url() .. path, {
-        headers = { zotero_api_version = "3" },
+        headers = { ["Zotero-API-Version"] = "3" },
         query = query,
         raw = { "--connect-timeout", "2", "--max-time", "30" },
     })
@@ -165,8 +165,8 @@ end
 function M:get(path, query)
     local response = _request("get", self:base_url() .. path, {
         headers = {
-            zotero_api_key = self.__config.api_key,
-            zotero_api_version = "3",
+            ["Zotero-API-Key"] = self.__config.api_key,
+            ["Zotero-API-Version"] = "3",
         },
         query = query,
     })
@@ -198,10 +198,10 @@ end
 function M:patch(path, body, version)
     local response = _request("patch", self:base_url() .. path, {
         headers = {
-            zotero_api_key = self.__config.api_key,
-            zotero_api_version = "3",
-            content_type = "application/json",
-            if_unmodified_since_version = tostring(version),
+            ["Zotero-API-Key"] = self.__config.api_key,
+            ["Zotero-API-Version"] = "3",
+            ["Content-Type"] = "application/json",
+            ["If-Unmodified-Since-Version"] = tostring(version),
         },
         body = vim.fn.json_encode(body),
     })
@@ -216,9 +216,9 @@ end
 function M:post(path, body)
     local response = _request("post", self:base_url() .. path, {
         headers = {
-            zotero_api_key = self.__config.api_key,
-            zotero_api_version = "3",
-            content_type = "application/json",
+            ["Zotero-API-Key"] = self.__config.api_key,
+            ["Zotero-API-Version"] = "3",
+            ["Content-Type"] = "application/json",
         },
         body = vim.fn.json_encode(body),
     })
