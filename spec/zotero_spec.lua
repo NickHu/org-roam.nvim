@@ -10,7 +10,7 @@ describe("org-roam-zotero", function()
             assert.are.equal("", config.api_key)
             assert.are.equal("user", config.library_type)
             assert.are.equal("", config.library_id)
-            assert.are.equal(false, config.auto_sync)
+            assert.are.equal(true, config.auto_sync)
             assert.are.equal(23119, config.local_api_port)
             assert.are.equal(true, config.prefer_local_api)
         end)
@@ -69,42 +69,53 @@ describe("org-roam-zotero", function()
         end)
     end)
 
-    describe("extract_related_keys", function()
-        it("should return empty table for nil relations", function()
-            local keys = ZoteroPlugin._extract_related_keys(nil)
-            assert.are.same({}, keys)
+    describe("extract_org_links", function()
+        it("should return empty table for nil input", function()
+            assert.are.same({}, Buffer.extract_org_links(nil))
         end)
 
-        it("should return empty table when no dc:relation key", function()
-            local keys = ZoteroPlugin._extract_related_keys({ other = "value" })
-            assert.are.same({}, keys)
+        it("should return empty table for empty input", function()
+            assert.are.same({}, Buffer.extract_org_links(""))
         end)
 
-        it("should extract item key from a single relation URI", function()
-            local keys = ZoteroPlugin._extract_related_keys({
-                ["dc:relation"] = "http://zotero.org/users/12345/items/ABCDEF",
-            })
-            assert.are.same({ "ABCDEF" }, keys)
+        it("should return empty table for text with no org links", function()
+            assert.are.same({}, Buffer.extract_org_links("This is plain text."))
         end)
 
-        it("should extract item keys from an array of relation URIs", function()
-            local keys = ZoteroPlugin._extract_related_keys({
-                ["dc:relation"] = {
-                    "http://zotero.org/users/12345/items/AAA111",
-                    "http://zotero.org/groups/67890/items/BBB222",
-                },
-            })
+        it("should extract a single Zotero link", function()
+            local keys = Buffer.extract_org_links("See [[id:zotero-ABC123]] for details.")
+            assert.are.same({ "ABC123" }, keys)
+        end)
+
+        it("should extract multiple Zotero links", function()
+            local keys = Buffer.extract_org_links(
+                "Compare [[id:zotero-AAA111]] with [[id:zotero-BBB222]]."
+            )
             assert.are.same({ "AAA111", "BBB222" }, keys)
         end)
 
-        it("should ignore URIs that don't match the /items/ pattern", function()
-            local keys = ZoteroPlugin._extract_related_keys({
-                ["dc:relation"] = {
-                    "http://zotero.org/users/12345/items/VALID",
-                    "http://example.com/not-a-zotero-uri",
-                },
-            })
+        it("should extract links with descriptions", function()
+            local keys = Buffer.extract_org_links("See [[id:zotero-XYZ789][Some paper]].")
+            assert.are.same({ "XYZ789" }, keys)
+        end)
+
+        it("should ignore non-Zotero org-roam links", function()
+            local keys = Buffer.extract_org_links(
+                "See [[id:some-other-node]] and [[id:zotero-VALID]]."
+            )
             assert.are.same({ "VALID" }, keys)
+        end)
+    end)
+
+    describe("build_relation_uri", function()
+        it("should build user library relation URI", function()
+            local uri = Buffer.build_relation_uri("user", "12345", "ITEM1")
+            assert.are.equal("http://zotero.org/users/12345/items/ITEM1", uri)
+        end)
+
+        it("should build group library relation URI", function()
+            local uri = Buffer.build_relation_uri("group", "67890", "ITEM1")
+            assert.are.equal("http://zotero.org/groups/67890/items/ITEM1", uri)
         end)
     end)
 
@@ -597,61 +608,40 @@ describe("org-roam-zotero", function()
             assert.are.equal("zotero-TITLE", results[1].id)
         end)
 
-        it("should establish links between related Zotero nodes", function()
-            local roam = utils.init_plugin({ setup = true })
+        it("should extract org-roam links from buffer body for Zotero relations", function()
+            -- This tests the new flow: org-roam links in the body → Zotero relations on write.
+            -- The extract_org_links function parses [[id:zotero-*]] links.
+            local body = table.concat({
+                "This paper discusses [[id:zotero-ITEMB][Paper B]].",
+                "",
+                "Also see [[id:zotero-ITEMC]].",
+            }, "\n")
 
-            roam.database:load():wait()
+            local linked_keys = Buffer.extract_org_links(body)
+            assert.are.same({ "ITEMB", "ITEMC" }, linked_keys)
 
-            -- Create two nodes that are "related" in Zotero
-            local uri_a = "zotero://select/library/items/ITEMA"
-            local uri_b = "zotero://select/library/items/ITEMB"
-            local node_a = Node:new({
-                id = "zotero-ITEMA",
-                origin = uri_a,
-                range = Range:new(
-                    { row = 0, column = 0, offset = 0 },
-                    { row = 0, column = 0, offset = 0 }
-                ),
-                file = uri_a,
-                mtime = 0,
-                title = "Paper A",
-                aliases = {},
-                tags = { "zotero" },
-                level = 0,
-                linked = { ["zotero-ITEMB"] = {} },
-            })
+            -- Build relation URIs for these links + the note's own parent
+            local relation_uris = {}
+            local seen = {}
 
-            local node_b = Node:new({
-                id = "zotero-ITEMB",
-                origin = uri_b,
-                range = Range:new(
-                    { row = 0, column = 0, offset = 0 },
-                    { row = 0, column = 0, offset = 0 }
-                ),
-                file = uri_b,
-                mtime = 0,
-                title = "Paper B",
-                aliases = {},
-                tags = { "zotero" },
-                level = 0,
-                linked = { ["zotero-ITEMA"] = {} },
-            })
+            -- Own parent item
+            local self_uri = Buffer.build_relation_uri("user", "12345", "ITEMA")
+            table.insert(relation_uris, self_uri)
+            seen[self_uri] = true
 
-            -- Insert both nodes
-            roam.database:insert(node_a, { overwrite = true }):wait()
-            roam.database:insert(node_b, { overwrite = true }):wait()
+            -- Linked items
+            for _, key in ipairs(linked_keys) do
+                local uri = Buffer.build_relation_uri("user", "12345", key)
+                if not seen[uri] then
+                    table.insert(relation_uris, uri)
+                    seen[uri] = true
+                end
+            end
 
-            -- Establish links (as sync() pass 2 would do)
-            roam.database:link("zotero-ITEMA", { "zotero-ITEMB" })
-            roam.database:link("zotero-ITEMB", { "zotero-ITEMA" })
-
-            -- Verify node A links to node B (via the core database)
-            local links_a = roam.database:get_links("zotero-ITEMA")
-            assert.is_not_nil(links_a["zotero-ITEMB"])
-
-            -- Verify node B has backlink from node A
-            local backlinks_b = roam.database:get_backlinks("zotero-ITEMB")
-            assert.is_not_nil(backlinks_b["zotero-ITEMA"])
+            assert.are.equal(3, #relation_uris)
+            assert.are.equal("http://zotero.org/users/12345/items/ITEMA", relation_uris[1])
+            assert.are.equal("http://zotero.org/users/12345/items/ITEMB", relation_uris[2])
+            assert.are.equal("http://zotero.org/users/12345/items/ITEMC", relation_uris[3])
         end)
 
         it("should work with group library URIs", function()

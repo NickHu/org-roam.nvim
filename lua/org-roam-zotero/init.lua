@@ -13,12 +13,19 @@
 -- If no org-roam-tagged child note exists in Zotero, one is created on
 -- the first write from the ephemeral buffer (not during sync).
 --
+-- On write, any org-roam links to other Zotero virtual nodes found in
+-- the buffer body are reflected back to Zotero as `dc:relation` entries
+-- on the child note.
+--
+-- Sync runs automatically on OrgRoamInitialized (asynchronously via
+-- coroutines) and can also be triggered manually with :ZoteroSync.
+--
 -- Usage:
 --   require("org-roam-zotero").setup({
 --     api_key     = "YOUR_ZOTERO_API_KEY",
 --     library_id  = "YOUR_USER_OR_GROUP_ID",
 --     -- library_type = "user",   -- default; or "group"
---     -- auto_sync    = false,    -- set true to sync on database load
+--     -- auto_sync    = true,     -- default; set false to disable auto sync
 --   })
 --
 -- Commands:
@@ -82,16 +89,17 @@ function M.setup(opts)
         M.sync()
     end, { desc = "Sync Zotero items as org-roam nodes" })
 
-    -- If auto_sync is enabled, hook into org-roam database load
+    -- Always sync on OrgRoamInitialized, asynchronously in the background.
+    -- The auto_sync option can be set to false to opt out.
     if config.auto_sync then
         vim.api.nvim_create_autocmd("User", {
             pattern = "OrgRoamInitialized",
             once = true,
             callback = function()
-                -- Small delay to ensure database is ready
+                -- Small delay to ensure database is ready, then run async
                 vim.defer_fn(function()
                     M.sync()
-                end, 500)
+                end, 100)
             end,
         })
     end
@@ -170,36 +178,6 @@ local function ensure_load_wrapped()
     INSTANCE.__load_wrapped = true
 end
 
----Extracts Zotero item keys from the `dc:relation` relations of a Zotero item.
----Relations are URIs like "http://zotero.org/users/123/items/ABCDEF".
----@param relations table<string, string|string[]>|nil
----@return string[] item_keys
-local function extract_related_item_keys(relations)
-    if not relations then
-        return {}
-    end
-
-    local keys = {}
-    local uris = relations["dc:relation"]
-    if not uris then
-        return keys
-    end
-
-    -- dc:relation can be a single string or an array
-    if type(uris) == "string" then
-        uris = { uris }
-    end
-
-    for _, uri in ipairs(uris) do
-        local item_key = uri:match("/items/([^/]+)$")
-        if item_key then
-            table.insert(keys, item_key)
-        end
-    end
-
-    return keys
-end
-
 ---Creates an org-roam Node for a Zotero item.
 ---@param item org-roam-zotero.ZoteroItem
 ---@param config org-roam-zotero.Config
@@ -245,7 +223,12 @@ end
 ---for the buffer handler; otherwise the note is created lazily on first
 ---write from the ephemeral buffer.
 ---
----Zotero "related" items are synchronised as org-roam links between nodes.
+---The call is always wrapped in a coroutine so that the underlying curl
+---requests are non-blocking (they use `vim.system()` and yield).
+---
+---Relations are *not* read from Zotero here.  Instead, when a virtual
+---node's buffer is written, the links found in the body are pushed to
+---Zotero as `dc:relation` entries (see buffer.lua).
 ---
 ---@param opts? {on_done?:fun(count:integer)}
 function M.sync(opts)
@@ -255,97 +238,72 @@ function M.sync(opts)
         return
     end
 
-    local api = INSTANCE.__api
+    local function do_sync()
+        local api = INSTANCE.__api
 
-    vim.notify("org-roam-zotero: syncing Zotero items…", vim.log.levels.INFO)
+        vim.schedule(function()
+            vim.notify("org-roam-zotero: syncing Zotero items…", vim.log.levels.INFO)
+        end)
 
-    -- Fetch items (synchronous for simplicity; runs curl under the hood)
-    local ok, items = api:fetch_items()
-    if not ok then
-        vim.notify("org-roam-zotero: failed to fetch items: " .. tostring(items), vim.log.levels.ERROR)
-        return
-    end
-
-    ---@cast items org-roam-zotero.ZoteroItem[]
-    local roam = get_roam()
-    local count = 0
-
-    -- Two-pass sync: first create all nodes, then resolve relations as links.
-    -- Pass 1: create nodes and build item_key -> node_id mapping
-    local nodes_by_item_key = {} ---@type table<string, string>
-    local item_relations = {}    ---@type table<string, string[]>
-
-    for _, item in ipairs(items) do
-        -- Skip attachments, notes, etc. at the top level
-        if item.data.itemType ~= "attachment" and item.data.itemType ~= "note" then
-            local node = make_node(item, INSTANCE.__config)
-
-            -- Try to find an existing org-roam note (but don't create one)
-            local note_ok, note = api:fetch_note(item.data.key)
-            if note_ok and note then
-                ---@cast note org-roam-zotero.ZoteroItem
-                -- Cache note metadata for the buffer handler
-                INSTANCE.__buffer.__note_cache[item.data.key] = {
-                    note_key = note.data.key,
-                    version = note.data.version,
-                }
-            end
-            -- If no note exists, the cache entry stays nil; note is created
-            -- on first write from the ephemeral buffer.
-
-            -- Track node for re-insertion after database reloads
-            INSTANCE.__synced_nodes[node.id] = node
-
-            -- Build item_key -> node_id mapping for relation resolution
-            nodes_by_item_key[item.data.key] = node.id
-
-            -- Collect related item keys from the parent item
-            local related = extract_related_item_keys(item.data.relations)
-            -- Also collect from the note if it exists
-            if note_ok and note then
-                local note_related = extract_related_item_keys(note.data.relations)
-                vim.list_extend(related, note_related)
-            end
-            if #related > 0 then
-                item_relations[node.id] = related
-            end
-
-            -- Insert into org-roam database (overwrite if already present)
-            roam.database:insert(node, { overwrite = true }):wait()
-            count = count + 1
+        -- Fetch items (non-blocking inside a coroutine via _exec)
+        local ok, items = api:fetch_items()
+        if not ok then
+            vim.schedule(function()
+                vim.notify("org-roam-zotero: failed to fetch items: " .. tostring(items), vim.log.levels.ERROR)
+            end)
+            return
         end
-    end
 
-    -- Pass 2: resolve Zotero relations as org-roam links between nodes
-    for node_id, related_keys in pairs(item_relations) do
-        local node = INSTANCE.__synced_nodes[node_id]
-        if node then
-            local linked = {}
-            for _, related_key in ipairs(related_keys) do
-                local related_node_id = nodes_by_item_key[related_key]
-                if related_node_id then
-                    linked[related_node_id] = {}
+        ---@cast items org-roam-zotero.ZoteroItem[]
+        local count = 0
+
+        for _, item in ipairs(items) do
+            -- Skip attachments, notes, etc. at the top level
+            if item.data.itemType ~= "attachment" and item.data.itemType ~= "note" then
+                local node = make_node(item, INSTANCE.__config)
+
+                -- Try to find an existing org-roam note (but don't create one)
+                local note_ok, note = api:fetch_note(item.data.key)
+                if note_ok and note then
+                    ---@cast note org-roam-zotero.ZoteroItem
+                    -- Cache note metadata for the buffer handler
+                    INSTANCE.__buffer.__note_cache[item.data.key] = {
+                        note_key = note.data.key,
+                        version = note.data.version,
+                    }
                 end
-            end
-            if not vim.tbl_isempty(linked) then
-                node.linked = linked
-                -- Establish links in the database graph
-                roam.database:link(node.id, vim.tbl_keys(linked))
+                -- If no note exists, the cache entry stays nil; note is created
+                -- on first write from the ephemeral buffer.
+
+                -- Track node for re-insertion after database reloads
+                INSTANCE.__synced_nodes[node.id] = node
+
+                -- Insert into org-roam database (overwrite if already present).
+                -- Database operations are fast (in-memory), schedule to main thread.
+                vim.schedule(function()
+                    local roam = get_roam()
+                    roam.database:insert(node, { overwrite = true }):wait()
+                end)
+                count = count + 1
             end
         end
+
+        -- Install the load() wrapper so Zotero nodes survive future reloads
+        vim.schedule(function()
+            ensure_load_wrapped()
+            vim.notify(
+                string.format("org-roam-zotero: synced %d Zotero item(s)", count),
+                vim.log.levels.INFO
+            )
+            if opts.on_done then
+                opts.on_done(count)
+            end
+        end)
     end
 
-    -- Install the load() wrapper so Zotero nodes survive future reloads
-    ensure_load_wrapped()
-
-    vim.notify(
-        string.format("org-roam-zotero: synced %d Zotero item(s)", count),
-        vim.log.levels.INFO
-    )
-
-    if opts.on_done then
-        opts.on_done(count)
-    end
+    -- Always run in a coroutine so that API calls are non-blocking.
+    local co = coroutine.create(do_sync)
+    coroutine.resume(co)
 end
 
 ---Returns the current plugin instance (for testing/external use).
@@ -358,8 +316,5 @@ end
 function M.reset()
     INSTANCE = nil
 end
-
--- Expose internal helpers for testing
-M._extract_related_keys = extract_related_item_keys
 
 return M

@@ -19,7 +19,7 @@ local DEFAULT = {
     api_key = "",
     library_type = "user",
     library_id = "",
-    auto_sync = false,
+    auto_sync = true,
     local_api_port = 23119,
     prefer_local_api = true,
 }

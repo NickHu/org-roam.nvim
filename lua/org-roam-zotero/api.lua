@@ -6,6 +6,36 @@
 -- Local API: https://github.com/zotero/zotero/blob/8.0/chrome/content/zotero/xpcom/server/server_localAPI.js
 -------------------------------------------------------------------------------
 
+---Executes a system command.
+---
+---When called from inside a coroutine the call is non-blocking: it uses
+---`vim.system()` with a callback and yields until the process exits.
+---Otherwise it falls back to the blocking `vim.fn.system()`.
+---
+---@param cmd string[]
+---@return string stdout, integer exit_code
+local function _exec(cmd)
+    local co = coroutine.running()
+    if co then
+        -- Async path: fire-and-forget via vim.system, yield until done.
+        local result
+        vim.system(cmd, { text = true }, function(obj)
+            result = obj
+            vim.schedule(function()
+                if coroutine.status(co) == "suspended" then
+                    coroutine.resume(co)
+                end
+            end)
+        end)
+        coroutine.yield()
+        return result.stdout or "", result.code
+    else
+        -- Sync/blocking path.
+        local output = vim.fn.system(cmd)
+        return output, vim.v.shell_error
+    end
+end
+
 ---@class org-roam-zotero.Api
 ---@field private __config org-roam-zotero.Config
 ---@field private __local_api_available boolean|nil #cached availability of local API
@@ -76,8 +106,8 @@ function M:is_local_api_available()
         string.format("http://localhost:%d/api/", port),
     }
 
-    vim.fn.system(cmd)
-    self.__local_api_available = (vim.v.shell_error == 0)
+    local _, exit_code = _exec(cmd)
+    self.__local_api_available = (exit_code == 0)
     return self.__local_api_available
 end
 
@@ -109,10 +139,10 @@ function M:local_get(path, query)
 
     table.insert(cmd, url)
 
-    local result = vim.fn.system(cmd)
+    local result, exit_code = _exec(cmd)
 
-    if vim.v.shell_error ~= 0 then
-        return false, "Local API request failed (exit code " .. vim.v.shell_error .. "): " .. result
+    if exit_code ~= 0 then
+        return false, "Local API request failed (exit code " .. exit_code .. "): " .. result
     end
 
     local ok, decoded = pcall(vim.fn.json_decode, result)
@@ -148,10 +178,10 @@ function M:get(path, query)
 
     table.insert(cmd, url)
 
-    local result = vim.fn.system(cmd)
+    local result, exit_code = _exec(cmd)
 
-    if vim.v.shell_error ~= 0 then
-        return false, "HTTP request failed (exit code " .. vim.v.shell_error .. "): " .. result
+    if exit_code ~= 0 then
+        return false, "HTTP request failed (exit code " .. exit_code .. "): " .. result
     end
 
     local ok, decoded = pcall(vim.fn.json_decode, result)
@@ -199,10 +229,10 @@ function M:patch(path, body, version)
         url,
     }
 
-    local result = vim.fn.system(cmd)
+    local result, exit_code = _exec(cmd)
 
-    if vim.v.shell_error ~= 0 then
-        return false, "HTTP PATCH failed (exit code " .. vim.v.shell_error .. "): " .. result
+    if exit_code ~= 0 then
+        return false, "HTTP PATCH failed (exit code " .. exit_code .. "): " .. result
     end
 
     -- PATCH may return empty body on success (204)
@@ -238,10 +268,10 @@ function M:post(path, body)
         url,
     }
 
-    local result = vim.fn.system(cmd)
+    local result, exit_code = _exec(cmd)
 
-    if vim.v.shell_error ~= 0 then
-        return false, "HTTP POST failed (exit code " .. vim.v.shell_error .. "): " .. result
+    if exit_code ~= 0 then
+        return false, "HTTP POST failed (exit code " .. exit_code .. "): " .. result
     end
 
     if result == "" then
@@ -377,16 +407,21 @@ function M:fetch_note(item_key)
     return true, nil
 end
 
----Updates the content of a note item in Zotero.
+---Updates the content (and optionally relations) of a note item in Zotero.
 ---Write requests always use the web API (local API is read-only).
 ---@param note_key string #key of the note item to update
 ---@param content string #new HTML content for the note
 ---@param version integer #current version for optimistic locking
+---@param relations? table<string, string|string[]> #optional dc:relation map
 ---@return boolean success, any result
-function M:update_note(note_key, content, version)
+function M:update_note(note_key, content, version, relations)
+    local body = { note = content }
+    if relations then
+        body.relations = relations
+    end
     return self:patch(
         string.format("/items/%s", note_key),
-        { note = content },
+        body,
         version
     )
 end

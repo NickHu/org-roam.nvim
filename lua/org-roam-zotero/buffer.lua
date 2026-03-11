@@ -75,6 +75,40 @@ function M.build_uri(library_type, library_id, item_key)
     end
 end
 
+---Builds a Zotero relation URI for a given item key.
+---
+---Relation URIs use the http://zotero.org/... scheme (not zotero://).
+---@param library_type string  "user" or "group"
+---@param library_id string    library/group ID
+---@param item_key string
+---@return string
+function M.build_relation_uri(library_type, library_id, item_key)
+    if library_type == "group" then
+        return string.format("http://zotero.org/groups/%s/items/%s", library_id, item_key)
+    else
+        return string.format("http://zotero.org/users/%s/items/%s", library_id, item_key)
+    end
+end
+
+---Extracts Zotero item keys from org-roam links in a text body.
+---
+---Matches `[[id:zotero-KEY]]` and `[[id:zotero-KEY][description]]` patterns.
+---@param text string
+---@return string[] item_keys
+function M.extract_org_links(text)
+    if not text or text == "" then
+        return {}
+    end
+
+    local keys = {}
+    -- Pattern: [[id:zotero-KEY]] or [[id:zotero-KEY][...]]
+    -- Capture KEY: everything after "zotero-" until the next "]"
+    for key in text:gmatch("%[%[id:zotero%-([^%]]+)%]") do
+        table.insert(keys, key)
+    end
+    return keys
+end
+
 ---Converts HTML note content to a simple plain-text representation.
 ---@param html string
 ---@return string
@@ -411,7 +445,37 @@ function M:__on_buf_write(buf, uri)
     local body = M.extract_body(buf)
     local html = M.text_to_html(body)
 
-    local ok, result = self.__api:update_note(note_key, html, version)
+    -- Build relations: the note is related to its own parent item and to
+    -- the parent items of all linked Zotero virtual nodes found in the body.
+    local relation_uris = {}
+    local seen = {}
+
+    -- Always relate the note to its own parent item
+    local self_uri = M.build_relation_uri(
+        self.__config.library_type,
+        self.__config.library_id,
+        item_key
+    )
+    table.insert(relation_uris, self_uri)
+    seen[self_uri] = true
+
+    -- Extract links to other Zotero virtual nodes from the body
+    local linked_keys = M.extract_org_links(body)
+    for _, linked_key in ipairs(linked_keys) do
+        local rel_uri = M.build_relation_uri(
+            self.__config.library_type,
+            self.__config.library_id,
+            linked_key
+        )
+        if not seen[rel_uri] then
+            table.insert(relation_uris, rel_uri)
+            seen[rel_uri] = true
+        end
+    end
+
+    local relations = { ["dc:relation"] = relation_uris }
+
+    local ok, result = self.__api:update_note(note_key, html, version, relations)
     if not ok then
         vim.notify(
             "org-roam-zotero: failed to update note: " .. tostring(result),
