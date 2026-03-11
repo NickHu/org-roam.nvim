@@ -110,29 +110,48 @@ describe("org-roam-zotero", function()
 
     describe("buffer", function()
         describe("parse_uri", function()
-            it("should parse valid zotero:// URIs", function()
-                local item_key, note_key = Buffer.parse_uri("zotero://ABC123/DEF456")
+            it("should parse user library zotero://select URIs", function()
+                local item_key, lib_type, lib_id = Buffer.parse_uri(
+                    "zotero://select/library/items/ABC123"
+                )
                 assert.are.equal("ABC123", item_key)
-                assert.are.equal("DEF456", note_key)
+                assert.are.equal("user", lib_type)
+                assert.is_nil(lib_id)
+            end)
+
+            it("should parse group library zotero://select URIs", function()
+                local item_key, lib_type, lib_id = Buffer.parse_uri(
+                    "zotero://select/groups/456/items/DEF789"
+                )
+                assert.are.equal("DEF789", item_key)
+                assert.are.equal("group", lib_type)
+                assert.are.equal("456", lib_id)
             end)
 
             it("should return nil for invalid URIs", function()
-                local item_key, note_key = Buffer.parse_uri("not-a-zotero-uri")
+                local item_key, lib_type, lib_id = Buffer.parse_uri("not-a-zotero-uri")
                 assert.is_nil(item_key)
-                assert.is_nil(note_key)
+                assert.is_nil(lib_type)
+                assert.is_nil(lib_id)
             end)
 
-            it("should return nil for partial URIs", function()
-                local item_key, note_key = Buffer.parse_uri("zotero://ABC123")
+            it("should return nil for old-style zotero://ITEM/NOTE URIs", function()
+                local item_key, lib_type, lib_id = Buffer.parse_uri("zotero://ABC123/DEF456")
                 assert.is_nil(item_key)
-                assert.is_nil(note_key)
+                assert.is_nil(lib_type)
+                assert.is_nil(lib_id)
             end)
         end)
 
         describe("build_uri", function()
-            it("should construct a valid zotero:// URI", function()
-                local uri = Buffer.build_uri("ITEM1", "NOTE1")
-                assert.are.equal("zotero://ITEM1/NOTE1", uri)
+            it("should construct a user library zotero://select URI", function()
+                local uri = Buffer.build_uri("user", "12345", "ITEM1")
+                assert.are.equal("zotero://select/library/items/ITEM1", uri)
+            end)
+
+            it("should construct a group library zotero://select URI", function()
+                local uri = Buffer.build_uri("group", "67890", "ITEM1")
+                assert.are.equal("zotero://select/groups/67890/items/ITEM1", uri)
             end)
         end)
 
@@ -196,15 +215,16 @@ describe("org-roam-zotero", function()
         end)
 
         describe("build_org_content", function()
-            it("should produce org content with properties and body", function()
+            it("should produce org content with properties and body (note exists)", function()
                 local lines = Buffer.build_org_content(
                     "ITEM1", "NOTE1", "My Paper",
                     "<p>Some notes here</p>", 42,
-                    "zotero-ITEM1-NOTE1"
+                    "zotero-ITEM1",
+                    "zotero://select/library/items/ITEM1"
                 )
                 assert.are.equal(":PROPERTIES:", lines[1])
-                assert.are.equal(":ID: zotero-ITEM1-NOTE1", lines[2])
-                assert.are.equal(":ROAM_ORIGIN: zotero://ITEM1", lines[3])
+                assert.are.equal(":ID: zotero-ITEM1", lines[2])
+                assert.are.equal(":ROAM_ORIGIN: zotero://select/library/items/ITEM1", lines[3])
                 assert.are.equal(":ZOTERO_ITEM_KEY: ITEM1", lines[4])
                 assert.are.equal(":ZOTERO_NOTE_KEY: NOTE1", lines[5])
                 assert.are.equal(":ZOTERO_VERSION: 42", lines[6])
@@ -217,22 +237,49 @@ describe("org-roam-zotero", function()
             it("should handle empty note content", function()
                 local lines = Buffer.build_org_content(
                     "ITEM1", "NOTE1", "Empty Paper",
-                    "", 1, "zotero-ITEM1-NOTE1"
+                    "", 1, "zotero-ITEM1",
+                    "zotero://select/library/items/ITEM1"
                 )
-                -- Should have properties + title + blank line, no body
                 assert.are.equal(":PROPERTIES:", lines[1])
                 assert.are.equal("#+title: Empty Paper", lines[8])
                 assert.are.equal("", lines[9])
                 assert.are.equal(nil, lines[10])
             end)
+
+            it("should omit ZOTERO_NOTE_KEY when note_key is nil", function()
+                local lines = Buffer.build_org_content(
+                    "ITEM1", nil, "No Note Yet",
+                    "", 0, "zotero-ITEM1",
+                    "zotero://select/library/items/ITEM1"
+                )
+                assert.are.equal(":PROPERTIES:", lines[1])
+                assert.are.equal(":ID: zotero-ITEM1", lines[2])
+                assert.are.equal(":ROAM_ORIGIN: zotero://select/library/items/ITEM1", lines[3])
+                assert.are.equal(":ZOTERO_ITEM_KEY: ITEM1", lines[4])
+                -- No ZOTERO_NOTE_KEY line
+                assert.are.equal(":ZOTERO_VERSION: 0", lines[5])
+                assert.are.equal(":END:", lines[6])
+                assert.are.equal("#+title: No Note Yet", lines[7])
+                assert.are.equal("", lines[8])
+                assert.are.equal(nil, lines[9])
+            end)
+
+            it("should use group library URI in ROAM_ORIGIN", function()
+                local lines = Buffer.build_org_content(
+                    "ITEM1", "NOTE1", "Group Paper",
+                    "", 1, "zotero-ITEM1",
+                    "zotero://select/groups/999/items/ITEM1"
+                )
+                assert.are.equal(":ROAM_ORIGIN: zotero://select/groups/999/items/ITEM1", lines[3])
+            end)
         end)
 
         describe("parse_buffer_metadata", function()
-            it("should extract metadata from org buffer", function()
+            it("should extract metadata from org buffer with note key", function()
                 local buf = vim.api.nvim_create_buf(false, true)
                 vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
                     ":PROPERTIES:",
-                    ":ID: zotero-ITEM1-NOTE1",
+                    ":ID: zotero-ITEM1",
                     ":ZOTERO_ITEM_KEY: ITEM1",
                     ":ZOTERO_NOTE_KEY: NOTE1",
                     ":ZOTERO_VERSION: 42",
@@ -249,6 +296,26 @@ describe("org-roam-zotero", function()
 
                 vim.api.nvim_buf_delete(buf, { force = true })
             end)
+
+            it("should handle missing note key (note not yet created)", function()
+                local buf = vim.api.nvim_create_buf(false, true)
+                vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+                    ":PROPERTIES:",
+                    ":ID: zotero-ITEM1",
+                    ":ZOTERO_ITEM_KEY: ITEM1",
+                    ":ZOTERO_VERSION: 0",
+                    ":END:",
+                    "#+title: Test",
+                    "",
+                })
+
+                local meta = Buffer.parse_buffer_metadata(buf)
+                assert.are.equal("ITEM1", meta.item_key)
+                assert.is_nil(meta.note_key)
+                assert.are.equal(0, meta.version)
+
+                vim.api.nvim_buf_delete(buf, { force = true })
+            end)
         end)
 
         describe("extract_body", function()
@@ -256,7 +323,7 @@ describe("org-roam-zotero", function()
                 local buf = vim.api.nvim_create_buf(false, true)
                 vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
                     ":PROPERTIES:",
-                    ":ID: zotero-ITEM1-NOTE1",
+                    ":ID: zotero-ITEM1",
                     ":END:",
                     "#+title: Test",
                     "",
@@ -275,7 +342,7 @@ describe("org-roam-zotero", function()
                 local buf = vim.api.nvim_create_buf(false, true)
                 vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
                     ":PROPERTIES:",
-                    ":ID: zotero-ITEM1-NOTE1",
+                    ":ID: zotero-ITEM1",
                     ":END:",
                     "#+title: Test",
                     "",
@@ -304,15 +371,16 @@ describe("org-roam-zotero", function()
         end)
 
         it("should create valid org-roam nodes for Zotero items", function()
-            -- Manually construct a node as make_node would
+            -- Manually construct a node as make_node would (user library)
+            local uri = "zotero://select/library/items/ITEM1"
             local node = Node:new({
-                id = "zotero-ITEM1-NOTE1",
-                origin = "zotero://ITEM1",
+                id = "zotero-ITEM1",
+                origin = uri,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://ITEM1/NOTE1",
+                file = uri,
                 mtime = 0,
                 title = "Test Paper",
                 aliases = {},
@@ -321,9 +389,9 @@ describe("org-roam-zotero", function()
                 linked = {},
             })
 
-            assert.are.equal("zotero-ITEM1-NOTE1", node.id)
-            assert.are.equal("zotero://ITEM1", node.origin)
-            assert.are.equal("zotero://ITEM1/NOTE1", node.file)
+            assert.are.equal("zotero-ITEM1", node.id)
+            assert.are.equal(uri, node.origin)
+            assert.are.equal(uri, node.file)
             assert.are.equal("Test Paper", node.title)
             assert.are.equal(0, node.level)
             assert.is_true(node:is_file_node())
@@ -337,14 +405,15 @@ describe("org-roam-zotero", function()
             -- Load the database first
             roam.database:load():wait()
 
+            local uri = "zotero://select/library/items/ITEM1"
             local node = Node:new({
-                id = "zotero-ITEM1-NOTE1",
-                origin = "zotero://ITEM1",
+                id = "zotero-ITEM1",
+                origin = uri,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://ITEM1/NOTE1",
+                file = uri,
                 mtime = 0,
                 title = "My Zotero Paper",
                 aliases = {},
@@ -357,11 +426,11 @@ describe("org-roam-zotero", function()
             roam.database:insert(node, { overwrite = true }):wait()
 
             -- Verify we can retrieve it
-            local retrieved = roam.database:get_sync("zotero-ITEM1-NOTE1")
+            local retrieved = roam.database:get_sync("zotero-ITEM1")
             assert.is_not_nil(retrieved)
             assert.are.equal("My Zotero Paper", retrieved.title)
-            assert.are.equal("zotero://ITEM1/NOTE1", retrieved.file)
-            assert.are.equal("zotero://ITEM1", retrieved.origin)
+            assert.are.equal(uri, retrieved.file)
+            assert.are.equal(uri, retrieved.origin)
         end)
 
         it("should find Zotero nodes by origin", function()
@@ -369,14 +438,15 @@ describe("org-roam-zotero", function()
 
             roam.database:load():wait()
 
+            local uri = "zotero://select/library/items/ABC"
             local node = Node:new({
-                id = "zotero-ABC-DEF",
-                origin = "zotero://ABC",
+                id = "zotero-ABC",
+                origin = uri,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://ABC/DEF",
+                file = uri,
                 mtime = 0,
                 title = "Searchable Paper",
                 aliases = {},
@@ -387,7 +457,7 @@ describe("org-roam-zotero", function()
 
             roam.database:insert(node, { overwrite = true }):wait()
 
-            local results = roam.database:find_nodes_by_origin_sync("zotero://ABC")
+            local results = roam.database:find_nodes_by_origin_sync(uri)
             assert.are.equal(1, #results)
             assert.are.equal("Searchable Paper", results[1].title)
         end)
@@ -397,14 +467,15 @@ describe("org-roam-zotero", function()
 
             roam.database:load():wait()
 
+            local uri = "zotero://select/library/items/TAG"
             local node = Node:new({
-                id = "zotero-TAG-TEST",
-                origin = "zotero://TAG",
+                id = "zotero-TAG",
+                origin = uri,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://TAG/TEST",
+                file = uri,
                 mtime = 0,
                 title = "Tagged Paper",
                 aliases = {},
@@ -420,7 +491,7 @@ describe("org-roam-zotero", function()
 
             local found = false
             for _, n in ipairs(results) do
-                if n.id == "zotero-TAG-TEST" then
+                if n.id == "zotero-TAG" then
                     found = true
                     break
                 end
@@ -443,14 +514,15 @@ describe("org-roam-zotero", function()
             local inst = ZoteroPlugin.instance()
             ---@cast inst org-roam-zotero.Plugin
 
+            local uri = "zotero://select/library/items/PERSIST"
             local node = Node:new({
-                id = "zotero-PERSIST-TEST",
-                origin = "zotero://PERSIST",
+                id = "zotero-PERSIST",
+                origin = uri,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://PERSIST/TEST",
+                file = uri,
                 mtime = 0,
                 title = "Persistent Paper",
                 aliases = {},
@@ -460,7 +532,7 @@ describe("org-roam-zotero", function()
             })
 
             -- Track the node (as sync() would) and insert it
-            rawget(inst, "__synced_nodes")["zotero-PERSIST-TEST"] = node
+            rawget(inst, "__synced_nodes")["zotero-PERSIST"] = node
             roam.database:insert(node, { overwrite = true }):wait()
 
             -- Install the load wrapper (as sync() would)
@@ -481,7 +553,7 @@ describe("org-roam-zotero", function()
             end)
 
             -- Verify the node exists before reload
-            local before = roam.database:get_sync("zotero-PERSIST-TEST")
+            local before = roam.database:get_sync("zotero-PERSIST")
             assert.is_not_nil(before)
             assert.are.equal("Persistent Paper", before.title)
 
@@ -489,10 +561,10 @@ describe("org-roam-zotero", function()
             roam.database:load():wait()
 
             -- Verify the node still exists after reload
-            local after = roam.database:get_sync("zotero-PERSIST-TEST")
+            local after = roam.database:get_sync("zotero-PERSIST")
             assert.is_not_nil(after)
             assert.are.equal("Persistent Paper", after.title)
-            assert.are.equal("zotero://PERSIST/TEST", after.file)
+            assert.are.equal(uri, after.file)
         end)
 
         it("should make Zotero nodes findable by title", function()
@@ -500,14 +572,15 @@ describe("org-roam-zotero", function()
 
             roam.database:load():wait()
 
+            local uri = "zotero://select/library/items/TITLE"
             local node = Node:new({
-                id = "zotero-TITLE-FIND",
-                origin = "zotero://TITLE",
+                id = "zotero-TITLE",
+                origin = uri,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://TITLE/FIND",
+                file = uri,
                 mtime = 0,
                 title = "Unique Zotero Title For Find",
                 aliases = {},
@@ -521,7 +594,7 @@ describe("org-roam-zotero", function()
             -- Verify findable by title (used by find-node and completion)
             local results = roam.database:find_nodes_by_title_sync("Unique Zotero Title For Find")
             assert.are.equal(1, #results)
-            assert.are.equal("zotero-TITLE-FIND", results[1].id)
+            assert.are.equal("zotero-TITLE", results[1].id)
         end)
 
         it("should establish links between related Zotero nodes", function()
@@ -530,36 +603,38 @@ describe("org-roam-zotero", function()
             roam.database:load():wait()
 
             -- Create two nodes that are "related" in Zotero
+            local uri_a = "zotero://select/library/items/ITEMA"
+            local uri_b = "zotero://select/library/items/ITEMB"
             local node_a = Node:new({
-                id = "zotero-ITEMA-NOTEA",
-                origin = "zotero://ITEMA",
+                id = "zotero-ITEMA",
+                origin = uri_a,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://ITEMA/NOTEA",
+                file = uri_a,
                 mtime = 0,
                 title = "Paper A",
                 aliases = {},
                 tags = { "zotero" },
                 level = 0,
-                linked = { ["zotero-ITEMB-NOTEB"] = {} },
+                linked = { ["zotero-ITEMB"] = {} },
             })
 
             local node_b = Node:new({
-                id = "zotero-ITEMB-NOTEB",
-                origin = "zotero://ITEMB",
+                id = "zotero-ITEMB",
+                origin = uri_b,
                 range = Range:new(
                     { row = 0, column = 0, offset = 0 },
                     { row = 0, column = 0, offset = 0 }
                 ),
-                file = "zotero://ITEMB/NOTEB",
+                file = uri_b,
                 mtime = 0,
                 title = "Paper B",
                 aliases = {},
                 tags = { "zotero" },
                 level = 0,
-                linked = { ["zotero-ITEMA-NOTEA"] = {} },
+                linked = { ["zotero-ITEMA"] = {} },
             })
 
             -- Insert both nodes
@@ -567,16 +642,47 @@ describe("org-roam-zotero", function()
             roam.database:insert(node_b, { overwrite = true }):wait()
 
             -- Establish links (as sync() pass 2 would do)
-            roam.database:link("zotero-ITEMA-NOTEA", { "zotero-ITEMB-NOTEB" })
-            roam.database:link("zotero-ITEMB-NOTEB", { "zotero-ITEMA-NOTEA" })
+            roam.database:link("zotero-ITEMA", { "zotero-ITEMB" })
+            roam.database:link("zotero-ITEMB", { "zotero-ITEMA" })
 
             -- Verify node A links to node B (via the core database)
-            local links_a = roam.database:get_links("zotero-ITEMA-NOTEA")
-            assert.is_not_nil(links_a["zotero-ITEMB-NOTEB"])
+            local links_a = roam.database:get_links("zotero-ITEMA")
+            assert.is_not_nil(links_a["zotero-ITEMB"])
 
             -- Verify node B has backlink from node A
-            local backlinks_b = roam.database:get_backlinks("zotero-ITEMB-NOTEB")
-            assert.is_not_nil(backlinks_b["zotero-ITEMA-NOTEA"])
+            local backlinks_b = roam.database:get_backlinks("zotero-ITEMB")
+            assert.is_not_nil(backlinks_b["zotero-ITEMA"])
+        end)
+
+        it("should work with group library URIs", function()
+            local roam = utils.init_plugin({ setup = true })
+
+            roam.database:load():wait()
+
+            local uri = "zotero://select/groups/12345/items/GRPITEM"
+            local node = Node:new({
+                id = "zotero-GRPITEM",
+                origin = uri,
+                range = Range:new(
+                    { row = 0, column = 0, offset = 0 },
+                    { row = 0, column = 0, offset = 0 }
+                ),
+                file = uri,
+                mtime = 0,
+                title = "Group Paper",
+                aliases = {},
+                tags = { "zotero" },
+                level = 0,
+                linked = {},
+            })
+
+            roam.database:insert(node, { overwrite = true }):wait()
+
+            local retrieved = roam.database:get_sync("zotero-GRPITEM")
+            assert.is_not_nil(retrieved)
+            assert.are.equal("Group Paper", retrieved.title)
+            assert.are.equal(uri, retrieved.file)
+            assert.are.equal(uri, retrieved.origin)
         end)
     end)
 end)

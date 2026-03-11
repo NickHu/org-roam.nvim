@@ -349,7 +349,8 @@ function M:create_note(parent_item_key)
 end
 
 ---Fetches the first child note tagged "org-roam" for a given item key.
----If no such note exists, creates one via the web API.
+---Returns nil (not an error) if no such note exists; note creation is
+---deferred to the first write from the ephemeral buffer.
 ---@param item_key string
 ---@return boolean success, org-roam-zotero.ZoteroItem|nil|string result
 function M:fetch_note(item_key)
@@ -372,8 +373,8 @@ function M:fetch_note(item_key)
         end
     end
 
-    -- No org-roam-tagged note found; create one
-    return self:create_note(item_key)
+    -- No org-roam-tagged note found
+    return true, nil
 end
 
 ---Updates the content of a note item in Zotero.

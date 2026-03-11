@@ -6,41 +6,73 @@
 -- Uses the `zotero://` URI scheme so that `vim.cmd.edit("zotero://...")` is
 -- intercepted by BufReadCmd / BufWriteCmd autocmds.  This allows org-roam's
 -- existing `goto_node` to work without modification.
+--
+-- URIs conform to the Zotero protocol specification:
+--   zotero://select/library/items/[itemKey]          (user library)
+--   zotero://select/groups/[groupID]/items/[itemKey]  (group library)
+-- See https://github.com/zotero/zotero/blob/8.0/chrome/content/zotero/ZoteroProtocolHandler.mjs
 -------------------------------------------------------------------------------
 
 ---@class org-roam-zotero.Buffer
 ---@field private __api org-roam-zotero.Api
+---@field private __config org-roam-zotero.Config
 ---@field private __augroup integer
----@field private __note_cache table<string, {version:integer}>
+---@field __note_cache table<string, {note_key:string|nil, version:integer}>
 local M = {}
 M.__index = M
 
 ---Creates a new buffer manager.
 ---@param api org-roam-zotero.Api
+---@param config org-roam-zotero.Config
 ---@return org-roam-zotero.Buffer
-function M:new(api)
+function M:new(api, config)
     local instance = {}
     setmetatable(instance, M)
     instance.__api = api
+    instance.__config = config
     instance.__augroup = vim.api.nvim_create_augroup("org-roam-zotero", { clear = true })
     instance.__note_cache = {}
     return instance
 end
 
----Parses a `zotero://<item_key>/<note_key>` URI.
+---Parses a Zotero select URI.
+---
+---Supported formats (per Zotero protocol spec):
+---  zotero://select/library/items/[itemKey]
+---  zotero://select/groups/[groupID]/items/[itemKey]
+---
 ---@param uri string
----@return string|nil item_key, string|nil note_key
+---@return string|nil item_key
+---@return string|nil library_type  "user" or "group"
+---@return string|nil library_id    group ID (nil for user library)
 function M.parse_uri(uri)
-    local item_key, note_key = uri:match("^zotero://([^/]+)/([^/]+)$")
-    return item_key, note_key
+    -- User library: zotero://select/library/items/KEY
+    local item_key = uri:match("^zotero://select/library/items/([^/?]+)")
+    if item_key then
+        return item_key, "user", nil
+    end
+
+    -- Group library: zotero://select/groups/GROUPID/items/KEY
+    local group_id, gitem_key = uri:match("^zotero://select/groups/([^/]+)/items/([^/?]+)")
+    if group_id and gitem_key then
+        return gitem_key, "group", group_id
+    end
+
+    return nil, nil, nil
 end
 
----Builds a `zotero://` URI from item and note keys.
+---Builds a Zotero select URI from library info and item key.
+---
+---@param library_type string  "user" or "group"
+---@param library_id string    library/group ID
 ---@param item_key string
----@param note_key string
 ---@return string
-function M.build_uri(item_key, note_key)
-    return string.format("zotero://%s/%s", item_key, note_key)
+function M.build_uri(library_type, library_id, item_key)
+    if library_type == "group" then
+        return string.format("zotero://select/groups/%s/items/%s", library_id, item_key)
+    else
+        return string.format("zotero://select/library/items/%s", item_key)
+    end
 end
 
 ---Converts HTML note content to a simple plain-text representation.
@@ -133,26 +165,31 @@ end
 
 ---Builds the org-mode content for a Zotero note buffer.
 ---@param item_key string
----@param note_key string
+---@param note_key string|nil  #nil when the note has not been created yet
 ---@param title string
 ---@param note_html string
 ---@param version integer
 ---@param node_id string
+---@param origin_uri string    #the zotero://select/... URI
 ---@return string[]
-function M.build_org_content(item_key, note_key, title, note_html, version, node_id)
+function M.build_org_content(item_key, note_key, title, note_html, version, node_id, origin_uri)
     local body = M.html_to_text(note_html)
 
     local lines = {
         ":PROPERTIES:",
         ":ID: " .. node_id,
-        ":ROAM_ORIGIN: zotero://" .. item_key,
+        ":ROAM_ORIGIN: " .. origin_uri,
         ":ZOTERO_ITEM_KEY: " .. item_key,
-        ":ZOTERO_NOTE_KEY: " .. note_key,
-        ":ZOTERO_VERSION: " .. tostring(version),
-        ":END:",
-        "#+title: " .. title,
-        "",
     }
+
+    if note_key then
+        table.insert(lines, ":ZOTERO_NOTE_KEY: " .. note_key)
+    end
+
+    table.insert(lines, ":ZOTERO_VERSION: " .. tostring(version))
+    table.insert(lines, ":END:")
+    table.insert(lines, "#+title: " .. title)
+    table.insert(lines, "")
 
     if body ~= "" then
         for _, line in ipairs(vim.split(body, "\n")) do
@@ -251,89 +288,119 @@ end
 ---@param buf integer
 ---@param uri string
 function M:__on_buf_read(buf, uri)
-    local item_key, note_key = M.parse_uri(uri)
-    if not item_key or not note_key then
+    local item_key = M.parse_uri(uri)
+    if not item_key then
         vim.notify("org-roam-zotero: invalid URI: " .. uri, vim.log.levels.ERROR)
         return
     end
 
-    -- Check if we already have cached metadata for this note
-    local cached = self.__note_cache[note_key]
-    if not cached then
-        -- Fetch from Zotero
-        local ok, note = self.__api:fetch_note(item_key)
-        if not ok or not note then
-            vim.notify(
-                "org-roam-zotero: failed to fetch note for item " .. item_key,
-                vim.log.levels.ERROR
-            )
-            return
-        end
-
-        ---@cast note org-roam-zotero.ZoteroItem
-        cached = { version = note.data.version }
-        self.__note_cache[note_key] = cached
-    end
-
-    -- Fetch the note directly to get fresh content
-    local ok_get, note_resp = self.__api:read(
-        string.format("/items/%s", note_key),
+    -- Fetch the parent item for the title
+    local ok_item, item_resp = self.__api:read(
+        string.format("/items/%s", item_key),
         { format = "json" }
     )
-    if not ok_get then
-        vim.notify("org-roam-zotero: failed to fetch note " .. note_key, vim.log.levels.ERROR)
-        return
+    local title = item_key
+    if ok_item and item_resp then
+        ---@cast item_resp org-roam-zotero.ZoteroItem
+        title = (item_resp.data or {}).title or title
     end
 
-    ---@cast note_resp org-roam-zotero.ZoteroItem
-    local data = note_resp.data
-    if not data then
-        vim.notify("org-roam-zotero: unexpected API response for note " .. note_key, vim.log.levels.WARN)
-        data = {}
-    end
-    local note_html = data.note or ""
-    local version = note_resp.version or cached.version
+    -- Check the note cache, or look up the note via API
+    local cached = self.__note_cache[item_key]
+    local note_key = cached and cached.note_key or nil
+    local version = cached and cached.version or 0
+    local note_html = ""
 
-    -- Try to get the parent item's title
-    local title = note_key
-    if data.parentItem then
-        local ok_parent, parent_resp = self.__api:read(
-            string.format("/items/%s", data.parentItem),
+    if not note_key then
+        -- No note in cache; try to find one via the API
+        local ok, note = self.__api:fetch_note(item_key)
+        if ok and note then
+            ---@cast note org-roam-zotero.ZoteroItem
+            note_key = note.data.key
+            version = note.data.version
+            note_html = note.data.note or ""
+            self.__note_cache[item_key] = { note_key = note_key, version = version }
+        else
+            -- No note exists yet; show empty buffer (note created on first write)
+            self.__note_cache[item_key] = { note_key = nil, version = 0 }
+        end
+    else
+        -- Fetch the note directly to get fresh content
+        local ok_get, note_resp = self.__api:read(
+            string.format("/items/%s", note_key),
             { format = "json" }
         )
-        if ok_parent and parent_resp then
-            ---@cast parent_resp org-roam-zotero.ZoteroItem
-            title = (parent_resp.data or {}).title or title
+        if ok_get and note_resp then
+            ---@cast note_resp org-roam-zotero.ZoteroItem
+            local data = note_resp.data
+            if not data then
+                vim.notify("org-roam-zotero: unexpected API response for note " .. note_key, vim.log.levels.WARN)
+                data = {}
+            end
+            note_html = data.note or ""
+            version = note_resp.version or version
+            self.__note_cache[item_key] = { note_key = note_key, version = version }
         end
     end
 
-    -- Build the node ID consistently
-    local node_id = "zotero-" .. item_key .. "-" .. note_key
+    -- Build the node ID and origin URI
+    local node_id = "zotero-" .. item_key
+    local origin_uri = M.build_uri(
+        self.__config.library_type,
+        self.__config.library_id,
+        item_key
+    )
 
-    local lines = M.build_org_content(item_key, note_key, title, note_html, version, node_id)
+    local lines = M.build_org_content(item_key, note_key, title, note_html, version, node_id, origin_uri)
 
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.bo[buf].modified = false
     vim.bo[buf].filetype = "org"
     vim.bo[buf].buftype = "acwrite"
-
-    -- Update cache
-    self.__note_cache[note_key] = { version = version }
 end
 
 ---Handles writing a zotero:// buffer back to Zotero.
+---If no note exists yet, creates one on the first write.
 ---@param buf integer
 ---@param uri string
 function M:__on_buf_write(buf, uri)
-    local _, note_key_from_uri = M.parse_uri(uri)
+    local item_key_from_uri = M.parse_uri(uri)
     local meta = M.parse_buffer_metadata(buf)
 
-    local note_key = meta.note_key or note_key_from_uri
+    local item_key = meta.item_key or item_key_from_uri
+    local note_key = meta.note_key
     local version = meta.version
 
-    if not note_key then
-        vim.notify("org-roam-zotero: cannot determine note key for write", vim.log.levels.ERROR)
+    if not item_key then
+        vim.notify("org-roam-zotero: cannot determine item key for write", vim.log.levels.ERROR)
         return
+    end
+
+    -- If no note exists yet, create one on first write
+    if not note_key then
+        local ok, created = self.__api:create_note(item_key)
+        if not ok or not created then
+            vim.notify(
+                "org-roam-zotero: failed to create note for item " .. item_key .. ": " .. tostring(created),
+                vim.log.levels.ERROR
+            )
+            return
+        end
+
+        ---@cast created org-roam-zotero.ZoteroItem
+        note_key = created.data.key
+        version = created.data.version
+
+        -- Update the buffer properties to include the new note key
+        local buf_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+        for i, line in ipairs(buf_lines) do
+            if line:match("^:ZOTERO_VERSION:") then
+                -- Insert ZOTERO_NOTE_KEY before ZOTERO_VERSION
+                table.insert(buf_lines, i, ":ZOTERO_NOTE_KEY: " .. note_key)
+                break
+            end
+        end
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, buf_lines)
     end
 
     if not version then
@@ -360,7 +427,7 @@ function M:__on_buf_write(buf, uri)
     else
         new_version = version + 1
     end
-    self.__note_cache[note_key] = { version = new_version }
+    self.__note_cache[item_key] = { note_key = note_key, version = new_version }
 
     -- Update the version in the buffer properties
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)

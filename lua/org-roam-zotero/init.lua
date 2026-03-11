@@ -4,11 +4,14 @@
 -- Main entry point for the org-roam-zotero plugin.
 --
 -- This plugin extends org-roam.nvim to treat Zotero collection items as
--- virtual org-roam nodes.  Each Zotero item that has a child note is
--- represented as a node whose file path uses the `zotero://` URI scheme.
+-- virtual org-roam nodes.  Each Zotero item is represented as a node whose
+-- file path uses a `zotero://select/...` URI that conforms to the Zotero
+-- protocol specification.
 --
 -- Opening a Zotero node opens an ephemeral buffer populated from the
 -- Zotero Web API; writing that buffer pushes the content back to Zotero.
+-- If no org-roam-tagged child note exists in Zotero, one is created on
+-- the first write from the ephemeral buffer (not during sync).
 --
 -- Usage:
 --   require("org-roam-zotero").setup({
@@ -59,7 +62,7 @@ function M.setup(opts)
     end
 
     local api = Api:new(config)
-    local buffer = Buffer:new(api)
+    local buffer = Buffer:new(api, config)
 
     local instance = setmetatable({}, M)
     instance.__config = config
@@ -197,15 +200,14 @@ local function extract_related_item_keys(relations)
     return keys
 end
 
----Creates an org-roam Node for a Zotero item + note pair.
+---Creates an org-roam Node for a Zotero item.
 ---@param item org-roam-zotero.ZoteroItem
----@param note org-roam-zotero.ZoteroItem
+---@param config org-roam-zotero.Config
 ---@return org-roam.core.file.Node
-local function make_node(item, note)
+local function make_node(item, config)
     local item_key = item.data.key
-    local note_key = note.data.key
-    local node_id = "zotero-" .. item_key .. "-" .. note_key
-    local uri = Buffer.build_uri(item_key, note_key)
+    local node_id = "zotero-" .. item_key
+    local uri = Buffer.build_uri(config.library_type, config.library_id, item_key)
 
     local tags = {}
     if item.data.tags then
@@ -220,7 +222,7 @@ local function make_node(item, note)
 
     return Node:new({
         id = node_id,
-        origin = "zotero://" .. item_key,
+        origin = uri,
         range = Range:new(
             { row = 0, column = 0, offset = 0 },
             { row = 0, column = 0, offset = 0 }
@@ -237,9 +239,11 @@ end
 
 ---Synchronises Zotero items into the org-roam database.
 ---
----Fetches all top-level items from the configured Zotero library, finds
----those with at least one `note` child tagged "org-roam" (creating one if
----needed), and inserts a virtual node for each into the org-roam database.
+---Fetches all top-level items from the configured Zotero library and
+---inserts a virtual node for each into the org-roam database.  If an item
+---already has an org-roam-tagged child note, the note metadata is cached
+---for the buffer handler; otherwise the note is created lazily on first
+---write from the ephemeral buffer.
 ---
 ---Zotero "related" items are synchronised as org-roam links between nodes.
 ---
@@ -274,34 +278,41 @@ function M.sync(opts)
     for _, item in ipairs(items) do
         -- Skip attachments, notes, etc. at the top level
         if item.data.itemType ~= "attachment" and item.data.itemType ~= "note" then
+            local node = make_node(item, INSTANCE.__config)
+
+            -- Try to find an existing org-roam note (but don't create one)
             local note_ok, note = api:fetch_note(item.data.key)
             if note_ok and note then
                 ---@cast note org-roam-zotero.ZoteroItem
-                local node = make_node(item, note)
-
-                -- Cache note version for the buffer handler
-                INSTANCE.__buffer.__note_cache[note.data.key] = {
+                -- Cache note metadata for the buffer handler
+                INSTANCE.__buffer.__note_cache[item.data.key] = {
+                    note_key = note.data.key,
                     version = note.data.version,
                 }
+            end
+            -- If no note exists, the cache entry stays nil; note is created
+            -- on first write from the ephemeral buffer.
 
-                -- Track node for re-insertion after database reloads
-                INSTANCE.__synced_nodes[node.id] = node
+            -- Track node for re-insertion after database reloads
+            INSTANCE.__synced_nodes[node.id] = node
 
-                -- Build item_key -> node_id mapping for relation resolution
-                nodes_by_item_key[item.data.key] = node.id
+            -- Build item_key -> node_id mapping for relation resolution
+            nodes_by_item_key[item.data.key] = node.id
 
-                -- Collect related item keys from both parent item and note
-                local related = extract_related_item_keys(item.data.relations)
+            -- Collect related item keys from the parent item
+            local related = extract_related_item_keys(item.data.relations)
+            -- Also collect from the note if it exists
+            if note then
                 local note_related = extract_related_item_keys(note.data.relations)
                 vim.list_extend(related, note_related)
-                if #related > 0 then
-                    item_relations[node.id] = related
-                end
-
-                -- Insert into org-roam database (overwrite if already present)
-                roam.database:insert(node, { overwrite = true }):wait()
-                count = count + 1
             end
+            if #related > 0 then
+                item_relations[node.id] = related
+            end
+
+            -- Insert into org-roam database (overwrite if already present)
+            roam.database:insert(node, { overwrite = true }):wait()
+            count = count + 1
         end
     end
 
