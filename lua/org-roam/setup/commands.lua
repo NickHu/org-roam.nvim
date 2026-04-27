@@ -77,7 +77,7 @@ return function(roam)
             local profiler = require("org-roam.core.utils.profiler"):new()
             profiler:start()
             return roam.database
-                :load()
+                :load({ force = "scan" })
                 :next(function(...)
                     local tt = profiler:stop():time_taken_as_string()
                     require("org-roam.core.ui.notify").info("Loaded database [took " .. tt .. "]")

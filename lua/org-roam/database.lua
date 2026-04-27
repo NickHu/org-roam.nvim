@@ -192,18 +192,18 @@ function M:save(opts)
             return require("orgmode.utils.promise").resolve(false)
         end
 
-        -- Refresh our data (no rescan or force) to make sure it is fresh
-        return self:load():next(function()
-            return db:write_to_disk(self.__database_path):next(function()
-                profiler:stop(rec_id)
-                require("org-roam.core.log").fmt_debug(
-                    "saving database took %s",
-                    profiler:time_taken_as_string({ recording = rec_id })
-                )
+        -- Write the current in-memory database to disk.
+        -- All database modifications are applied immediately via load_file()
+        -- and update_on_save, so there is no need to rescan files here.
+        return db:write_to_disk(self.__database_path):next(function()
+            profiler:stop(rec_id)
+            require("org-roam.core.log").fmt_debug(
+                "saving database took %s",
+                profiler:time_taken_as_string({ recording = rec_id })
+            )
 
-                self.__last_save = db:changed_tick()
-                return true
-            end)
+            self.__last_save = db:changed_tick()
+            return true
         end)
     end)
 end

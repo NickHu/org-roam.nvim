@@ -16,17 +16,35 @@ return function(roam)
         org_files = roam.config.org_files,
     })
 
-    -- Load the database asynchronously, forcing a full sweep of directory
-    return roam.database
-        :load({ force = "scan" })
-        :next(function()
-            -- If we are persisting to disk, do so now as the database may
-            -- have changed post-load
-            if roam.config.database.persist then
-                return roam.database:save()
-            else
-                return Promise.resolve(nil)
-            end
-        end)
-        :catch(require("org-roam.core.ui.notify").error)
+    -- Load the database asynchronously.
+    --
+    -- On the very first launch (no database cache on disk yet) force a full
+    -- directory scan so the database gets populated from scratch, then save
+    -- the result to disk.
+    --
+    -- On every subsequent launch just deserialise the cached database from
+    -- disk. The expensive OrgFiles glob + TreeSitter pass is skipped entirely;
+    -- it was saturating the vim.schedule queue with synchronous work (stat
+    -- calls, TreeSitter parses) for every file on every startup, causing a
+    -- multi-second UI stall on large vaults. Files are kept current by the
+    -- update_on_save autocmd (per-save) and the :RoamUpdate command (manual
+    -- full rescan).
+    if vim.fn.filereadable(roam.config.database.path) == 1 then
+        return roam.database
+            :internal()
+            :catch(require("org-roam.core.ui.notify").error)
+    else
+        return roam.database
+            :load({ force = "scan" })
+            :next(function()
+                -- If we are persisting to disk, do so now as the database may
+                -- have changed post-load
+                if roam.config.database.persist then
+                    return roam.database:save()
+                else
+                    return Promise.resolve(nil)
+                end
+            end)
+            :catch(require("org-roam.core.ui.notify").error)
+    end
 end
